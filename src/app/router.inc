@@ -1,6 +1,16 @@
 ; Routes.
 
 cstring allow_get, 'Allow: GET',13,10
+cstring body_ready, '{"status":"ready"}'
+cstring body_db_unavailable, '{"error":"database_unavailable"}'
+
+; Continuations for database replies (see pg_deliver), indexed by CONT_xxx.
+CONT_READY	= 0
+
+rodata
+	align 8
+	pg_cont_tbl	dq cont_ready
+end rodata
 
 ; r12 = connection; g_req holds the parsed request.
 route:
@@ -26,6 +36,17 @@ route:
 	jne	.not_found
 	cmp	dword [rsi+3],'adyz'
 	jne	.not_found
+	; Readiness is a real round trip through the query pipeline.
+	cmp	dword [req_method],M_GET
+	jne	.get_only
+	mov	edi,STMT_PING
+	mov	esi,CONT_READY
+	xor	edx,edx
+	xor	ecx,ecx
+	call	db_query
+	test	eax,eax
+	jnz	respond_db_unavailable
+	ret
 .health:
 	cmp	dword [req_method],M_GET
 	jne	.get_only
@@ -45,3 +66,22 @@ route:
 .not_implemented:
 	mov	edi,ST_501
 	jmp	respond_status
+
+respond_db_unavailable:
+	mov	edi,ST_503
+	lea	rsi,[body_db_unavailable]
+	mov	edx,body_db_unavailable.len
+	xor	ecx,ecx
+	xor	r8d,r8d
+	jmp	respond
+
+; eax = PGR_xxx.
+cont_ready:
+	cmp	eax,PGR_OK
+	jne	respond_db_unavailable
+	mov	edi,ST_200
+	lea	rsi,[body_ready]
+	mov	edx,body_ready.len
+	xor	ecx,ecx
+	xor	r8d,r8d
+	jmp	respond

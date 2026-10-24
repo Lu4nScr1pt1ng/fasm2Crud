@@ -76,6 +76,7 @@ worker_main:
 	js	.no_files
 
 	call	date_init
+	call	pg_init
 	call	arm_accept
 	call	arm_timer
 	call	arm_signal
@@ -247,6 +248,7 @@ on_timer:
 @@:
 	inc	dword [g_tick]
 	call	date_update
+	call	pg_tick
 
 	cmp	dword [g_accept_paused],0
 	je	.sweep_start
@@ -282,7 +284,7 @@ on_timer:
 	mov	ecx,LINGER_TIMEOUT
 	jmp	.check
 @@:
-	test	eax,F_SEND
+	test	eax,F_SEND or F_WAIT_DB
 	jnz	.busy
 	cmp	dword [r12+C_IN_LEN],0
 	je	.check
@@ -335,7 +337,7 @@ on_signal:
 	jne	.each
 	cmp	dword [r12+C_IN_LEN],0
 	jne	.each
-	test	dword [r12+C_FLAGS],F_SEND or F_LINGER
+	test	dword [r12+C_FLAGS],F_SEND or F_LINGER or F_WAIT_DB
 	jnz	.each
 	call	close_conn
 	jmp	.each

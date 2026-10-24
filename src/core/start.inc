@@ -14,6 +14,14 @@ cstring env_port, 'API_PORT='
 cstring env_workers, 'API_WORKERS='
 cstring env_max_conns, 'API_MAX_CONNS='
 cstring env_busy_poll, 'API_BUSY_POLL_US='
+cstring env_db_host, 'API_DB_HOST='
+cstring env_db_port, 'API_DB_PORT='
+cstring env_db_user, 'API_DB_USER='
+cstring env_db_name, 'API_DB_NAME='
+cstring env_db_password, 'API_DB_PASSWORD='
+cstring env_db_conns, 'API_DB_CONNS='
+cstring default_db_user, 'api'
+cstring default_db_name, 'fasm2crud'
 
 start:
 	; At entry: [rsp] = argc, then argv[], NULL, envp[], NULL.
@@ -47,6 +55,12 @@ start:
 ;   API_WORKERS    worker processes (default: CPUs this process may run on)
 ;   API_MAX_CONNS  connections per worker (default 8192)
 ;   API_BUSY_POLL_US  spin this long for new completions before sleeping
+;   API_DB_HOST    PostgreSQL IPv4 address; unset disables the database
+;   API_DB_PORT    (default 5432)
+;   API_DB_USER    (default api)
+;   API_DB_NAME    (default fasm2crud)
+;   API_DB_PASSWORD  required with API_DB_HOST
+;   API_DB_CONNS   connections per worker (default 2)
 config_load:
 	; CPUs available to us, honouring cgroup cpusets and taskset.
 	xor	edi,edi
@@ -106,4 +120,71 @@ config_load:
 	mov	r8d,1000000
 	call	env_uint
 	mov	[g_busy_poll_us],eax
+	jmp	config_db
+
+; Database settings. Strings point into the environment block.
+config_db:
+	lea	rdi,[env_db_host]
+	mov	esi,env_db_host.len
+	call	getenv
+	test	rax,rax
+	jz	.disabled
+	mov	rsi,rax
+	call	parse_ipv4
+	jc	.bad_host
+	mov	[g_db_addr],eax
+	mov	dword [g_db_enabled],1
+
+	lea	rdi,[env_db_port]
+	mov	esi,env_db_port.len
+	mov	edx,5432
+	mov	ecx,1
+	mov	r8d,65535
+	call	env_uint
+	mov	[g_db_port],eax
+	lea	rdi,[env_db_conns]
+	mov	esi,env_db_conns.len
+	mov	edx,2
+	mov	ecx,1
+	mov	r8d,PG_MAX_CONNS
+	call	env_uint
+	mov	[g_pg_count],eax
+
+	lea	rdi,[env_db_user]
+	mov	esi,env_db_user.len
+	lea	rdx,[default_db_user]
+	mov	ecx,default_db_user.len
+	call	env_string
+	mov	[g_db_user],rax
+	mov	[g_db_user_len],edx
+	lea	rdi,[env_db_name]
+	mov	esi,env_db_name.len
+	lea	rdx,[default_db_name]
+	mov	ecx,default_db_name.len
+	call	env_string
+	mov	[g_db_name],rax
+	mov	[g_db_name_len],edx
+	lea	rdi,[env_db_password]
+	mov	esi,env_db_password.len
+	xor	edx,edx
+	xor	ecx,ecx
+	call	env_string
+	test	edx,edx
+	jz	.no_password
+	mov	[g_db_pass],rax
+	mov	[g_db_pass_len],edx
 	ret
+.disabled:
+	ret
+.bad_host:
+	call	log_begin
+	log_lit 'invalid API_DB_HOST: expected an IPv4 address'
+	call	log_end
+	mov	edi,EXIT_CONFIG
+	jmp	exit_process
+.no_password:
+	call	log_begin
+	log_lit 'API_DB_PASSWORD is required with API_DB_HOST'
+	call	log_end
+	mov	edi,EXIT_CONFIG
+	jmp	exit_process

@@ -12,7 +12,16 @@ services:
       # Poll for 50 us after the last completion before sleeping: at low
       # concurrency it cut p99 from 265 us to 31 us (docs/ARCHITECTURE.md).
       API_BUSY_POLL_US: "50"
-    cpuset: "${API_CPUS:-0-7}"
+      # The binary has no DNS resolver: it reaches PostgreSQL by address.
+      API_DB_HOST: "10.231.0.10"
+      API_DB_USER: "api"
+      API_DB_NAME: "${POSTGRES_DB:-fasm2crud}"
+      API_DB_PASSWORD: "${API_DB_PASSWORD:-change-me-too}"
+      API_DB_CONNS: "2"
+    networks:
+      backend:
+        ipv4_address: 10.231.0.20
+    cpuset: "${API_CPUS:-0-3,8-11}"
     # Docker's default seccomp profile blocks io_uring; this one is the same
     # profile with only io_uring_setup/enter/register added.
     security_opt:
@@ -45,7 +54,7 @@ services:
       - pgdata:/var/lib/postgresql
       - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
       - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
-    cpuset: "${PG_CPUS:-8-11}"
+    cpuset: "${PG_CPUS:-4-5,12-13}"
     shm_size: 1g
     security_opt:
       - seccomp=./docker/seccomp.json   # PostgreSQL 18 uses io_uring too
@@ -57,6 +66,15 @@ services:
       retries: 30
     stop_grace_period: 30s
     restart: unless-stopped
+    networks:
+      backend:
+        ipv4_address: 10.231.0.10
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 10.231.0.0/24
 
 volumes:
   pgdata:

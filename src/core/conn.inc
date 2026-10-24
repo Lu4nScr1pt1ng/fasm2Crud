@@ -23,6 +23,7 @@ C_ACTIVE_POS	= 28		; index in g_active_list
 C_SCAN		= 32		; where the header terminator search resumes
 C_FIDX		= 36		; direct descriptor index
 C_LINGER	= 40		; bytes discarded during lingering close
+C_GEN		= 64		; bumped per accept; outside the zeroed header
 
 CS_FREE		= 0
 CS_OPEN		= 1
@@ -33,6 +34,7 @@ F_SEND		= 1 shl 1
 F_WAIT_OUT	= 1 shl 2
 F_CLOSE_AFTER	= 1 shl 3
 F_LINGER	= 1 shl 4
+F_WAIT_DB	= 1 shl 5	; a database reply will answer the current request
 
 macro conn_ptr reg*, slot*
 	mov	reg,slot
@@ -141,6 +143,7 @@ on_accept:
 	vmovdqu	[r12+32],xmm0
 	vmovdqu	[r12+48],xmm0
 	mov	[r12+C_FIDX],r14d
+	inc	dword [r12+C_GEN]
 	mov	dword [r12+C_STATE],CS_OPEN
 	mov	eax,[g_tick]
 	mov	[r12+C_LAST],eax
@@ -306,7 +309,9 @@ conn_flush:
 	jnz	.done
 	jmp	start_linger
 .read_more:
-	test	eax,F_RECV or F_WAIT_OUT
+	; Waiting on output or on the database: stop reading, so TCP pushes
+	; back on the client instead of our buffers filling up.
+	test	eax,F_RECV or F_WAIT_OUT or F_WAIT_DB
 	jnz	.done
 	jmp	arm_recv
 .done:
@@ -381,6 +386,12 @@ conn_release:
 	mov	[g_free_top],eax
 	ret
 
+; A database reply answered the current request: carry on with the input.
+http_resume:
+	and	dword [r12+C_FLAGS],not F_WAIT_DB
+	call	process_input
+	jmp	conn_flush
+
 ; Parse and answer every complete request in the input buffer (pipelining),
 ; then move any partial request to the front of the buffer.
 process_input:
@@ -392,6 +403,8 @@ process_input:
 	jz	.compact
 	test	dword [r12+C_FLAGS],F_CLOSE_AFTER
 	jnz	.discard
+	test	dword [r12+C_FLAGS],F_WAIT_DB
+	jnz	.compact			; answer in order: wait for the reply
 	mov	eax,OUT_CAP
 	sub	eax,[r12+C_OUT_LEN]
 	cmp	eax,RESP_RESERVE

@@ -4,7 +4,7 @@ SOURCES   := $(shell find src -name '*.asm' -o -name '*.inc')
 BIN       := build/fasm2crud
 KAT       := build/kat
 
-.PHONY: all toolchain run test kat up down logs bench clean
+.PHONY: all toolchain run test itest kat up down logs bench clean
 
 all: $(BIN)
 
@@ -33,6 +33,9 @@ test: $(BIN) $(KAT)
 	./$(KAT)
 	python3 -I tests/kat/differential.py
 	./tests/smoke.sh
+
+itest: $(BIN)
+	./tests/db_integration.sh
 
 up:
 	docker compose up -d --build

@@ -146,6 +146,81 @@ getenv:
 	xor	eax,eax
 	ret
 
+; String setting: rdi = "NAME=", esi = its length, rdx/ecx = default.
+; rax = value, edx = length (1..255). Exits with EXIT_CONFIG when too long.
+env_string:
+	push	rdx
+	push	rcx
+	call	getenv
+	pop	rcx
+	pop	rdx
+	test	rax,rax
+	jz	.default
+	xor	edx,edx
+@@:
+	cmp	byte [rax+rdx],0
+	je	.measured
+	inc	edx
+	cmp	edx,255
+	jbe	@b
+	call	log_begin
+	log_lit 'a database setting is longer than 255 characters'
+	call	log_end
+	mov	edi,EXIT_CONFIG
+	jmp	exit_process
+.measured:
+	test	edx,edx
+	jnz	.done
+.default:
+	mov	rax,rdx
+	mov	edx,ecx
+.done:
+	ret
+
+; rsi = "a.b.c.d". eax = address in network byte order, CF on error.
+parse_ipv4:
+	xor	eax,eax				; result
+	xor	ecx,ecx				; octets seen
+.octet:
+	xor	edx,edx				; value
+	xor	r8d,r8d				; digits
+.digit:
+	movzx	r9d,byte [rsi]
+	sub	r9d,'0'
+	cmp	r9d,9
+	ja	.end_octet
+	imul	edx,edx,10
+	add	edx,r9d
+	inc	r8d
+	inc	rsi
+	cmp	r8d,3
+	jbe	.digit
+	jmp	.bad
+.end_octet:
+	test	r8d,r8d
+	jz	.bad
+	cmp	edx,255
+	ja	.bad
+	lea	r10d,[rcx*8]
+	shlx	edx,edx,r10d			; first octet in the lowest byte
+	or	eax,edx
+	inc	ecx
+	movzx	r9d,byte [rsi]
+	inc	rsi
+	cmp	ecx,4
+	je	.last
+	cmp	r9b,'.'
+	je	.octet
+	jmp	.bad
+.last:
+	test	r9b,r9b
+	jnz	.bad
+	clc
+	ret
+.bad:
+	stc
+	ret
+
 ; rsi = NUL-terminated decimal (at most 9 digits). rax = value, CF on error.
 parse_uint_cstr:
 	xor	eax,eax

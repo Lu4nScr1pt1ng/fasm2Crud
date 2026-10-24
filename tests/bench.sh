@@ -11,7 +11,7 @@ set -eu
 PATH_="${1:-/healthz}"
 CONNS="${2:-512}"
 SECS="${3:-10}"
-CPUS="${BENCH_CPUS:-12-15}"
+CPUS="${BENCH_CPUS:-6-7,14-15}"
 
 IP="$(docker inspect fasm2crud-api-1 --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}')"
 URL="http://$IP:8080$PATH_"

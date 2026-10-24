@@ -54,9 +54,9 @@ H = b"Host: t\r\n"
 CLOSE = b"Connection: close\r\n"
 CASES = [
     ("health", b"GET /healthz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [200]),
-    ("ready", b"GET /readyz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [200]),
+    ("ready without a database", b"GET /readyz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [503]),
     ("pipelined", (b"GET /healthz HTTP/1.1\r\n" + H + b"\r\n") * 3
-     + b"GET /readyz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [200] * 4),
+     + b"GET /healthz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [200] * 4),
     ("one byte per write", b"GET /healthz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [200], 1),
     ("query string", b"GET /healthz?x=1 HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [200]),
     ("case-insensitive names", b"GET /healthz HTTP/1.1\r\nhOsT: t\r\ncOnNeCtIoN: Close\r\n\r\n", [200]),

@@ -124,11 +124,52 @@ so B-tree inserts stay on the right edge) and `synchronous_commit = on`: a
 The API connects as the `api` role. It can read and write rows and nothing
 else (no DDL, no superuser).
 
-The wire protocol (v3) will be spoken directly from assembly: SCRAM-SHA-256
-authentication, statements prepared at connection startup, binary results,
-and several queries pipelined per connection without waiting for each
-reply. Parameters are never interpolated into SQL, which rules out SQL
-injection by construction.
+### Client (`src/db/`)
+
+The frontend/backend protocol v3 is spoken directly from assembly, over
+the same io_uring as the HTTP traffic. Each worker keeps `API_DB_CONNS`
+connections:
+
+```
+IDLE -> CONNECTING -> AUTH -> PREPARING -> READY
+             \_________\__________\________\__> BROKEN -> IDLE (backoff)
+```
+
+* **Authentication:** SCRAM-SHA-256 only. Cleartext and MD5 requests are
+  refused. The server's final signature is verified, so whoever answers
+  must know the password. The nonce comes from getrandom.
+* **Prepared statements:** every statement in the table (`pg_statement`)
+  is parsed once per connection, right after login.
+* **Pipelining:** a query is Bind + Execute + Sync, appended to the
+  connection's transmit buffer. One send in flight carries every query
+  queued since the previous one, and up to 128 queries wait per
+  connection. Replies arrive in order and a FIFO matches each
+  ReadyForQuery to its HTTP request. With Sync per query, an error aborts
+  only that query.
+* **Text format** for parameters and results: rows go straight into JSON.
+  Parameters travel separately from the SQL text, so SQL injection is
+  impossible by construction.
+* **Waiting requests:** the HTTP connection stops reading (F_WAIT_DB) until
+  its reply arrives, so pipelined requests are answered in order and a
+  slow database pushes back through TCP. A generation counter per slot
+  drops replies for clients that disconnected meanwhile.
+* **Failures:** a broken connection answers every waiting request with 503
+  at once and reconnects after an exponential backoff, from 100 ms doubling
+  to 5 s with jitter. When no connection is ready, requests get 503
+  immediately (a circuit breaker by construction). Deadlines: 3 s to
+  connect, 5 s for the handshake, 15 s without a reply while queries wait,
+  `statement_timeout` 5 s on the server, TCP keepalive and
+  `TCP_USER_TIMEOUT` 10 s.
+* **Addressing:** there is no DNS resolver. Compose gives the database a
+  fixed address (10.231.0.10) and `API_DB_HOST` points at it.
+
+Measured (API on 4 cores, PostgreSQL on 2, `GET /readyz` = one `SELECT 1`
+per request): 32 us p50 for a single client, about 280-300k queries/s
+under load, and zero non-2xx responses. During a database restart under
+traffic, clients only saw 200 or 503 (never a hang or a reset), and 200
+was back 0.4 s after PostgreSQL. One connection per worker gives the most
+throughput, because more queries share each packet; two (the default)
+give a better tail and survive the loss of one.
 
 ## Authentication (planned)
 
@@ -176,9 +217,10 @@ contexts, the Argon2 memory and its stack frame) are wiped before return.
 
 ## Benchmarking honestly
 
-* Pin the API, the database and the load generator to separate CPUs
-  (`API_CPUS`, `PG_CPUS`, `BENCH_CPUS`). Otherwise they compete for the
-  same cores and the numbers mean little.
+* Pin the API, the database and the load generator to separate physical
+  cores (`API_CPUS`, `PG_CPUS`, `BENCH_CPUS`; the defaults split a 5700G
+  4/2/2). Otherwise they compete for the same cores and the numbers mean
+  little.
 * Target the container's bridge IP (`tests/bench.sh`). Published ports on
   loopback go through the userland docker-proxy: 295k req/s through it
   against 755k req/s direct, on the same build.
@@ -229,8 +271,8 @@ throughput, see `supervisor.inc`).
 | 1 | supervisor, workers, io_uring, HTTP/1.1, health endpoints | done |
 | 2 | memory pools, limits, timeouts, graceful shutdown | done |
 | 3 | crypto with known-answer tests: SHA-256 (SHA-NI), HMAC, PBKDF2, BLAKE2b, Argon2id, getrandom | done |
-| 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | next |
-| 5 | auth: register, login, refresh, logout | |
+| 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | done |
+| 5 | auth: register, login, refresh, logout | next |
 | 6 | notes CRUD, JSON, keyset pagination, If-Match | |
 | 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | |
 | 8 | stress tests, `perf`, tuning | |
