@@ -2,8 +2,9 @@ TOOLCHAIN := .toolchain/fasm2
 FASMG     := $(TOOLCHAIN)/fasmg.x64
 SOURCES   := $(shell find src -name '*.asm' -o -name '*.inc')
 BIN       := build/fasm2crud
+KAT       := build/kat
 
-.PHONY: all toolchain run test up down logs bench clean
+.PHONY: all toolchain run test kat up down logs bench clean
 
 all: $(BIN)
 
@@ -17,10 +18,20 @@ $(BIN): $(SOURCES) | $(FASMG)
 	INCLUDE="$(TOOLCHAIN)/include" $(FASMG) -e100 -i "Include 'fasm2.inc'" src/main.asm $@
 	@chmod +x $@
 
+$(KAT): tests/kat/kat.asm $(SOURCES) | $(FASMG)
+	@mkdir -p build
+	INCLUDE="$(TOOLCHAIN)/include" $(FASMG) -e100 -i "Include 'fasm2.inc'" tests/kat/kat.asm $@
+	@chmod +x $@
+
+kat: $(KAT)
+	./$(KAT)
+
 run: $(BIN)
 	./$(BIN)
 
-test: $(BIN)
+test: $(BIN) $(KAT)
+	./$(KAT)
+	python3 -I tests/kat/differential.py
 	./tests/smoke.sh
 
 up:

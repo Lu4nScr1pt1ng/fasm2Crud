@@ -28,6 +28,7 @@ SYS_exit_group		= 231
 SYS_waitid		= 247
 SYS_signalfd4		= 289
 SYS_prlimit64		= 302
+SYS_getrandom		= 318
 SYS_io_uring_setup	= 425
 SYS_io_uring_enter	= 426
 SYS_io_uring_register	= 427
