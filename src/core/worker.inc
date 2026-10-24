@@ -7,12 +7,18 @@ bss
 	g_draining	dd ?
 	g_drain_deadline dd ?
 	g_sig_buf:	rb SIGINFO_SIZE
+	align 8
+	g_tsc_per_us	dq ?
+	g_spin_ticks	dq ?
+	g_spin_until	dq ?
+	g_reaped_mark	dd ?
 	g_cpu_mask:	rb 128
 end bss
 
 rodata
 	align 8
 	ts_tick		dq 1, 0			; __kernel_timespec: one second
+	ts_calibrate	dq 0, 10000000		; 10 ms
 	worker_name	db 'fasm2crud-w',0
 end rodata
 
@@ -74,12 +80,43 @@ worker_main:
 	call	arm_timer
 	call	arm_signal
 
+	call	tsc_calibrate
+	mov	eax,[g_busy_poll_us]
+	imul	rax,[g_tsc_per_us]
+	mov	[g_spin_ticks],rax
+
+	; While work keeps arriving, poll the ring without sleeping for up to
+	; API_BUSY_POLL_US after the last completion: sleeping and being woken
+	; costs more than a request. When the deadline passes, block.
 .loop:
 	cmp	dword [g_draining],0
-	je	.wait
+	je	.poll
 	cmp	dword [g_active_count],0
 	je	.drained
-.wait:
+.poll:
+	cmp	qword [g_spin_ticks],0
+	je	.block
+	rdtsc
+	shl	rdx,32
+	or	rax,rdx
+	add	rax,[g_spin_ticks]
+	mov	[g_spin_until],rax
+.spin:
+	mov	eax,[g_reaped]
+	mov	[g_reaped_mark],eax
+	xor	edi,edi
+	call	ring_enter
+	call	ring_reap
+	mov	eax,[g_reaped]
+	cmp	eax,[g_reaped_mark]
+	jne	.loop				; progress: restart the window
+	pause
+	rdtsc
+	shl	rdx,32
+	or	rax,rdx
+	cmp	rax,[g_spin_until]
+	jb	.spin
+.block:
 	mov	edi,1
 	call	ring_enter
 	call	ring_reap
@@ -122,6 +159,30 @@ worker_main:
 	call	log_end
 	mov	edi,EXIT_FATAL
 	jmp	exit_process
+
+; TSC ticks per microsecond (the TSC is invariant on every x86-64-v3 CPU).
+tsc_calibrate:
+	cmp	dword [g_busy_poll_us],0
+	je	.done
+	rdtsc
+	shl	rdx,32
+	or	rax,rdx
+	push	rax
+	lea	rdi,[ts_calibrate]
+	xor	esi,esi
+	mov	eax,SYS_nanosleep
+	syscall
+	rdtsc
+	shl	rdx,32
+	or	rax,rdx
+	pop	rcx
+	sub	rax,rcx
+	xor	edx,edx
+	mov	ecx,10000
+	div	rcx
+	mov	[g_tsc_per_us],rax
+.done:
+	ret
 
 ; edi = worker index: pin to the (index mod cpus)-th CPU we may run on.
 pin_to_cpu:

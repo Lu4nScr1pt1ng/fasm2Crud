@@ -23,6 +23,8 @@ RESP_RESERVE		= 1024		; room a handler may need for one response
 
 MAX_HEADERS		= 64
 
+DEFAULT_BUSY_POLL_US	= 0
+
 ; Timeouts in timer ticks (one tick per second).
 IDLE_TIMEOUT		= 60		; keep-alive connection with nothing in flight
 REQUEST_TIMEOUT		= 10		; partial request or response not yet drained

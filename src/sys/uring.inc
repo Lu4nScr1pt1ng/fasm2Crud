@@ -18,9 +18,11 @@ IORING_OFF_SQES			= 0x10000000
 
 ; io_uring_enter flags
 IORING_ENTER_GETEVENTS		= 1 shl 0
+IORING_ENTER_REGISTERED_RING	= 1 shl 4
 
 ; io_uring_register opcodes
 IORING_REGISTER_FILES2		= 13
+IORING_REGISTER_RING_FDS	= 20
 IORING_RSRC_REGISTER_SPARSE	= 1 shl 0
 
 ; struct io_uring_params (120 bytes)

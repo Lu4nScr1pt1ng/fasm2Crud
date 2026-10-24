@@ -21,6 +21,9 @@ bss
 	g_cq_mask	dd ?
 	g_sq_tail	dd ?		; local tail, published on ring_enter
 	g_sq_flushed	dd ?		; SQEs the kernel has consumed
+	g_enter_fd	dd ?		; ring fd, or its registered index
+	g_enter_flags	dd ?
+	g_reaped	dd ?		; completions handled so far
 	g_uparams:	rb UP_SIZE
 end bss
 
@@ -105,6 +108,28 @@ ring_init:
 	cmp	rax,-4095
 	jae	.done
 	mov	[g_sqes],rax
+
+	; Register the ring fd itself, so io_uring_enter skips the fd table
+	; lookup on every call. Optional: fall back to the plain fd.
+	mov	[g_enter_fd],ebx
+	mov	dword [g_enter_flags],IORING_ENTER_GETEVENTS
+	sub	rsp,16
+	mov	dword [rsp],-1			; offset: any free slot
+	mov	dword [rsp+4],0
+	mov	[rsp+8],rbx			; data: the ring fd
+	mov	edi,ebx
+	mov	esi,IORING_REGISTER_RING_FDS
+	mov	rdx,rsp
+	mov	r10d,1
+	mov	eax,SYS_io_uring_register
+	syscall
+	mov	ecx,[rsp]
+	add	rsp,16
+	cmp	eax,1
+	jne	.registered
+	mov	[g_enter_fd],ecx
+	mov	dword [g_enter_flags],IORING_ENTER_GETEVENTS or IORING_ENTER_REGISTERED_RING
+.registered:
 	xor	eax,eax
 .done:
 	pop	r12
@@ -183,8 +208,8 @@ ring_enter:
 	mov	esi,eax
 	sub	esi,[g_sq_flushed]
 	mov	edx,edi
-	mov	edi,[g_ring_fd]
-	mov	r10d,IORING_ENTER_GETEVENTS
+	mov	edi,[g_enter_fd]
+	mov	r10d,[g_enter_flags]
 	xor	r8d,r8d
 	xor	r9d,r9d
 	mov	eax,SYS_io_uring_enter
@@ -239,6 +264,7 @@ ring_reap:
 	mov	ebx,ebx
 	cmp	eax,OP_COUNT
 	jae	.next
+	inc	dword [g_reaped]
 	call	qword [dispatch_tbl+rax*8]
 	dec	ebp
 	jnz	.next

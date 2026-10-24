@@ -47,6 +47,12 @@ Each worker owns one ring, set up with:
 * One `io_uring_enter` per loop iteration submits all queued SQEs and waits
   for completions. After `REAP_BUDGET` completions the loop flushes
   submissions early to keep latency bounded under load.
+* The ring fd is registered (`IORING_REGISTER_RING_FDS`), so
+  `io_uring_enter` skips the fd lookup.
+* Optional adaptive busy polling (`API_BUSY_POLL_US`): after a completion
+  the worker keeps polling the ring for that long before blocking, which
+  avoids a sleep and wakeup per request at moderate load. Time is measured
+  with the TSC, calibrated at startup.
 * A multishot 1 s timeout drives connection timeouts and the cached `Date`
   header.
 * Signals arrive as reads on a signalfd, through the same ring.
@@ -162,9 +168,41 @@ the server answers 503.
 * Use wrk2 for latency percentiles (it corrects coordinated omission). Plain
   wrk understates tail latency under load.
 
-Reference (Ryzen 7 5700G, API on CPUs 0-7 and wrk on CPUs 8-15, which are
-the SMT siblings of the same cores, `GET /healthz`, 512 connections):
-about 750k req/s, p50 0.33 ms, p99 2 ms.
+* On this machine CPUs N and N+8 are SMT siblings (`lscpu -e`). Splitting
+  0-7 / 8-15 puts the server and the client on the same physical cores.
+
+### Where the time goes
+
+Under load, 95% of the workers' CPU time is in the kernel (TCP, loopback,
+io_uring) and 5% in our code. Faster user code can win at most that 5%;
+what moves latency is how the server waits for work and how load spreads
+over workers.
+
+### Reference numbers
+
+Ryzen 7 5700G. API with 8 workers on physical cores 0-3 and their SMT
+siblings (8-11), wrk on 4-7 and 12-15. `GET /healthz`, closed loop, wrk 4.2:
+
+| connections | busy poll off | busy poll 50 us |
+|---|---|---|
+| 1 | 57k req/s, p50 16 us, p99 27 us | 65k req/s, p50 14 us, p99 23 us |
+| 8 | 330k req/s, p50 21 us, p99 265 us | 362k req/s, p50 18 us, p99 31 us |
+| 16 | 516k req/s, p50 24 us, p99 393 us | 532k req/s, p50 25 us, p99 1.08 ms |
+| 64 | 691k req/s, p50 58 us, p99 1.05 ms | 652k req/s, p50 51 us, p99 2.41 ms |
+
+Throughput levels off at about 650-700k req/s from roughly 24 connections
+on. Past that point, extra concurrency only adds queueing (Little's law: 512
+requests in flight at 700k req/s is 0.7 ms of wait), so millisecond
+percentiles at 64 or 512 connections describe a saturated machine, not
+the server's service time. The rare millisecond p99 at 16-48 connections
+comes from scheduling noise, with client, server and loopback softirqs
+sharing four physical cores, and from SO_REUSEPORT hashing a few
+connections unevenly over workers. A real NIC with RSS and a separate
+client machine remove both. Fixed-rate (open-loop) latency curves need
+wrk2; oha's own overhead (p50 152 us at 50k req/s) hides the server.
+
+Measured and rejected: one accept queue shared by all workers (4x lower
+throughput, see `supervisor.inc`).
 
 ## Roadmap
 

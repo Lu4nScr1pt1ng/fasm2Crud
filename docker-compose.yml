@@ -9,6 +9,9 @@ services:
     environment:
       API_PORT: "8080"
       API_MAX_CONNS: "8192"
+      # Poll for 50 us after the last completion before sleeping: at low
+      # concurrency it cut p99 from 265 us to 31 us (docs/ARCHITECTURE.md).
+      API_BUSY_POLL_US: "50"
     cpuset: "${API_CPUS:-0-7}"
     # Docker's default seccomp profile blocks io_uring; this one is the same
     # profile with only io_uring_setup/enter/register added.

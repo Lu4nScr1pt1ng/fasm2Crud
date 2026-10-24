@@ -4,6 +4,7 @@ bss
 	g_port		dd ?
 	g_workers	dd ?
 	g_max_conns	dd ?
+	g_busy_poll_us	dd ?
 	g_cpu_count	dd ?
 	g_affinity:	rb 128		; cpu_set_t of the process at startup (1024 CPUs)
 end bss
@@ -12,6 +13,7 @@ cstring str_arg_healthcheck, 'healthcheck',0
 cstring env_port, 'API_PORT='
 cstring env_workers, 'API_WORKERS='
 cstring env_max_conns, 'API_MAX_CONNS='
+cstring env_busy_poll, 'API_BUSY_POLL_US='
 
 start:
 	; At entry: [rsp] = argc, then argv[], NULL, envp[], NULL.
@@ -44,6 +46,7 @@ start:
 ;   API_PORT       listening port (default 8080)
 ;   API_WORKERS    worker processes (default: CPUs this process may run on)
 ;   API_MAX_CONNS  connections per worker (default 8192)
+;   API_BUSY_POLL_US  spin this long for new completions before sleeping
 config_load:
 	; CPUs available to us, honouring cgroup cpusets and taskset.
 	xor	edi,edi
@@ -95,4 +98,12 @@ config_load:
 	mov	r8d,MAX_MAX_CONNS
 	call	env_uint
 	mov	[g_max_conns],eax
+
+	lea	rdi,[env_busy_poll]
+	mov	esi,env_busy_poll.len
+	mov	edx,DEFAULT_BUSY_POLL_US
+	xor	ecx,ecx
+	mov	r8d,1000000
+	call	env_uint
+	mov	[g_busy_poll_us],eax
 	ret

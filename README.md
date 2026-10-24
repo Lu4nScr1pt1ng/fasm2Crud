@@ -37,6 +37,7 @@ make down
 | `API_PORT` | `8080` | listening port |
 | `API_WORKERS` | CPUs available to the process | worker processes |
 | `API_MAX_CONNS` | `8192` | connections per worker |
+| `API_BUSY_POLL_US` | `0` | spin for completions this long before sleeping (compose sets 50) |
 
 ## Endpoints
 

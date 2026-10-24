@@ -61,6 +61,9 @@ supervisor_main:
 	syscall
 	mov	[g_sup_pid],eax
 
+	; One SO_REUSEPORT socket per worker. A single socket drained by every
+	; worker's multishot accept was measured at 4x lower throughput: the
+	; kernel kept handing all connections to the same worker.
 	xor	ebx,ebx
 .open_listeners:
 	call	listener_open
