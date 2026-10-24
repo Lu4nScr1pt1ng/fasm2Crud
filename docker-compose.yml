@@ -1,0 +1,59 @@
+name: fasm2crud
+
+services:
+  api:
+    build: .
+    image: fasm2crud:dev
+    ports:
+      - "127.0.0.1:${API_HOST_PORT:-8080}:8080"
+    environment:
+      API_PORT: "8080"
+      API_MAX_CONNS: "8192"
+    cpuset: "${API_CPUS:-0-7}"
+    # Docker's default seccomp profile blocks io_uring; this one is the same
+    # profile with only io_uring_setup/enter/register added.
+    security_opt:
+      - seccomp=./docker/seccomp.json
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    ulimits:
+      nofile: { soft: 1048576, hard: 1048576 }
+    sysctls:
+      net.core.somaxconn: "65535"
+      net.ipv4.tcp_max_syn_backlog: "65535"
+      net.ipv4.ip_local_port_range: "1024 65535"
+    stop_grace_period: 15s
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:18.1-alpine@sha256:b40d931bd0e7ce6eecc59a5a6ac3b3c04a01e559750e73e7086b6dbd7f8bf545
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf"]
+    environment:
+      POSTGRES_USER: "${POSTGRES_USER:-fasm2crud}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change-me}"
+      POSTGRES_DB: "${POSTGRES_DB:-fasm2crud}"
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+      API_DB_PASSWORD: "${API_DB_PASSWORD:-change-me-too}"
+    volumes:
+      - pgdata:/var/lib/postgresql
+      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    cpuset: "${PG_CPUS:-8-11}"
+    shm_size: 1g
+    security_opt:
+      - seccomp=./docker/seccomp.json   # PostgreSQL 18 uses io_uring too
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  pgdata:

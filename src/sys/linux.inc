@@ -1,0 +1,100 @@
+; Linux x86-64 kernel ABI: syscall numbers, flags and structure layouts.
+; Syscall convention: rax = number, args in rdi, rsi, rdx, r10, r8, r9;
+; the kernel clobbers rcx and r11 and returns -errno in rax on failure.
+
+SYS_read		= 0
+SYS_write		= 1
+SYS_close		= 3
+SYS_mmap		= 9
+SYS_mprotect		= 10
+SYS_rt_sigaction	= 13
+SYS_rt_sigprocmask	= 14
+SYS_nanosleep		= 35
+SYS_getpid		= 39
+SYS_socket		= 41
+SYS_connect		= 42
+SYS_bind		= 49
+SYS_listen		= 50
+SYS_setsockopt		= 54
+SYS_fork		= 57
+SYS_exit		= 60
+SYS_kill		= 62
+SYS_getppid		= 110
+SYS_prctl		= 157
+SYS_sched_setaffinity	= 203
+SYS_sched_getaffinity	= 204
+SYS_clock_gettime	= 228
+SYS_exit_group		= 231
+SYS_waitid		= 247
+SYS_signalfd4		= 289
+SYS_prlimit64		= 302
+SYS_io_uring_setup	= 425
+SYS_io_uring_enter	= 426
+SYS_io_uring_register	= 427
+
+; errno
+EINTR		= 4
+EAGAIN		= 11
+EBUSY		= 16
+ENFILE		= 23
+EMFILE		= 24
+ETIME		= 62
+ECANCELED	= 125
+
+; mmap / mprotect
+PROT_NONE	= 0
+PROT_READ	= 1
+PROT_WRITE	= 2
+MAP_SHARED	= 0x01
+MAP_PRIVATE	= 0x02
+MAP_ANONYMOUS	= 0x20
+MAP_NORESERVE	= 0x4000
+MAP_POPULATE	= 0x8000
+PAGE_SIZE	= 4096
+
+; signals
+SIGINT		= 2
+SIGKILL		= 9
+SIGPIPE		= 13
+SIGTERM		= 15
+SIGCHLD		= 17
+SIG_BLOCK	= 0
+SIG_IGN		= 1
+SFD_CLOEXEC	= 0x80000
+SIGINFO_SIZE	= 128		; signalfd_siginfo and siginfo_t are both 128 bytes
+
+; waitid
+P_ALL		= 0
+WNOHANG		= 1
+WEXITED		= 4
+CLD_EXITED	= 1
+SI_CODE		= 8		; siginfo_t field offsets
+SI_PID		= 16
+SI_STATUS	= 24
+
+; prctl
+PR_SET_PDEATHSIG = 1
+PR_SET_NAME	 = 15
+
+; resource limits
+RLIMIT_NOFILE	= 7
+
+; clocks
+CLOCK_REALTIME	= 0
+CLOCK_MONOTONIC	= 1
+
+; sockets
+AF_INET		= 2
+SOCK_STREAM	= 1
+SOCK_CLOEXEC	= 0x80000
+SOL_SOCKET	= 1
+SO_REUSEADDR	= 2
+SO_REUSEPORT	= 15
+SO_RCVTIMEO	= 20
+SO_SNDTIMEO	= 21
+IPPROTO_TCP	= 6
+TCP_NODELAY	= 1
+TCP_DEFER_ACCEPT = 9
+SHUT_WR		= 1
+MSG_NOSIGNAL	= 0x4000
+INADDR_LOOPBACK	= 0x0100007F	; 127.0.0.1 in network byte order
