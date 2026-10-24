@@ -12,13 +12,14 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 import argon2_ref  # noqa: E402
+import base64  # noqa: E402
 
 KAT = os.path.join(os.path.dirname(__file__), "..", "..", "build", "kat")
 
 
 def run(mode, data):
-    out = subprocess.run([KAT, mode], input=data, capture_output=True, check=True)
-    return out.stderr.decode().strip()
+    out = subprocess.run([KAT, mode], input=data, capture_output=True)
+    return out.stderr.decode().strip() if out.returncode == 0 else None
 
 
 def main():
@@ -61,6 +62,19 @@ def main():
         if run("argon2", raw) != want:
             print(f"FAIL argon2 type {kind} t={t} m={m} p={p} tag {outlen}")
             failures += 1
+    for n in range(0, 300):
+        data = rng.randbytes(n)
+        expect = [base64.b64encode(data), base64.urlsafe_b64encode(data).rstrip(b"=")]
+        for mode in (0, 1):
+            checks += 1
+            if run("base64", bytes([mode]) + data) != expect[mode].hex():
+                print(f"FAIL base64 encode mode {mode} length {n}")
+                failures += 1
+        for mode in (2, 3):
+            checks += 1
+            if run("base64", bytes([mode]) + expect[mode - 2]) != data.hex():
+                print(f"FAIL base64 decode mode {mode} length {n}")
+                failures += 1
     total = checks
     print(f"{total - failures}/{total} differential checks passed")
     return 1 if failures else 0

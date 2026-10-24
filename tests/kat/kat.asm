@@ -16,6 +16,8 @@ include '../../src/crypto/sha256.inc'
 include '../../src/crypto/hmac.inc'
 include '../../src/crypto/blake2b.inc'
 include '../../src/crypto/argon2.inc'
+include '../../src/core/base64.inc'
+include '../../src/db/scram.inc'
 
 bss
 	align 16
@@ -27,6 +29,8 @@ bss
 	kat_hex:	rb 2
 	align 8
 	kat_a2:		rb ARGON2_SIZE
+	kat_scram:	rb SC_SIZE
+	kat_msg:	rb SCRAM_MAX_MSG
 	kat_hexbuf:	rb 2050
 	align 4096
 	kat_mem:	rb 64 * 1024 * 1024
@@ -90,6 +94,21 @@ hexbytes a2_tag_d, '512b391b6f1162975371d30919734294f868e3be3984f3c1a13a4db9fabe
 hexbytes a2_tag_i, 'c814d9d1dc7f37aa13f0d77f2494bda1c8de6b016dd388d29952a4c4672b6ce8'
 hexbytes a2_tag_id, '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659'
 vector p_passwd, 'passwd'
+vector b64_in, 'foobar'
+vector b64_out_std, 'Zm9vYmFy'
+vector b64_out_f, 'Zg=='
+vector b64_out_fo, 'Zm8='
+vector b64_out_fob, 'Zm9vYg'
+vector b64_bad_pad, 'Zg='
+vector b64_bad_bits, 'Zh=='
+vector sc_password, 'pencil'
+vector sc_nonce, 'rOprNGfwEbeRWgbNEkqO'
+vector sc_first, 'n=user,r=rOprNGfwEbeRWgbNEkqO'
+vector sc_server, 'r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096'
+vector sc_final, 'c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=dHzbZapWIk4jUhN+Ute9ytag9zjfMHgsqmmiz7AndVQ='
+vector sc_verifier, 'v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4='
+vector sc_forged, 'v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G5='
+vector sc_bad_nonce, 'r=XXprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096'
 vector p_password, 'password'
 vector s_salt, 'salt'
 hexbytes dk_passwd_1, '55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc'
@@ -111,6 +130,7 @@ cstring arg_hmac, 'hmac',0
 cstring arg_bench, 'bench',0
 cstring arg_blake2b, 'blake2b',0
 cstring arg_argon2, 'argon2',0
+cstring arg_b64, 'base64',0
 
 start:
 	mov	rax,[rsp]
@@ -150,6 +170,12 @@ start:
 	call	cstr_eq
 	test	eax,eax
 	jnz	argon2_stdin
+	mov	rax,[g_argv]
+	mov	rdi,[rax+8]
+	lea	rsi,[arg_b64]
+	call	cstr_eq
+	test	eax,eax
+	jnz	base64_stdin
 	mov	edi,2
 	jmp	exit_process
 .vectors:
@@ -272,6 +298,9 @@ start:
 	call	argon2_rfc
 	check	'argon2id rfc9106', a2_tag_id
 
+	call	base64_tests
+	call	scram_tests
+
 	; getrandom: 64 bytes, not all zero.
 	lea	rdi,[kat_out]
 	mov	ecx,64
@@ -299,6 +328,186 @@ start:
 .finish:
 	mov	edi,[kat_failed]
 	jmp	exit_process
+
+; Report a boolean result: eax = 1 passes.
+macro expect name*
+	local n
+	cstring n, name
+	lea	rsi,[n]
+	mov	edx,n.len
+	call	report_bool
+end macro
+
+cstring str_ok, 'ok   '
+cstring str_fail, 'FAIL '
+
+; eax = result, rsi = name, edx = name length.
+report_bool:
+	push	rsi
+	push	rdx
+	push	rax
+	call	log_begin
+	pop	rax
+	lea	rsi,[str_fail]
+	lea	rcx,[str_ok]
+	test	eax,eax
+	cmovnz	rsi,rcx
+	sete	cl
+	or	byte [kat_failed],cl
+	mov	edx,str_ok.len
+	call	log_str
+	pop	rdx
+	pop	rsi
+	call	log_str
+	jmp	log_end
+
+; rdi = produced, esi = produced length, rdx = expected, ecx = its length.
+; eax = 1 when identical.
+same_bytes:
+	xor	eax,eax
+	cmp	esi,ecx
+	jne	.done
+	mov	rsi,rdx
+	mov	edx,ecx
+	jmp	ct_equal
+.done:
+	ret
+
+base64_tests:
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_in]
+	mov	edx,6
+	call	base64_encode
+	lea	rdi,[kat_out]
+	mov	esi,eax
+	lea	rdx,[b64_out_std]
+	mov	ecx,b64_out_std.len
+	call	same_bytes
+	expect	'base64 encode foobar'
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_in]
+	mov	edx,1
+	call	base64_encode
+	lea	rdi,[kat_out]
+	mov	esi,eax
+	lea	rdx,[b64_out_f]
+	mov	ecx,b64_out_f.len
+	call	same_bytes
+	expect	'base64 encode f (two pad)'
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_in]
+	mov	edx,2
+	call	base64_encode
+	lea	rdi,[kat_out]
+	mov	esi,eax
+	lea	rdx,[b64_out_fo]
+	mov	ecx,b64_out_fo.len
+	call	same_bytes
+	expect	'base64 encode fo (one pad)'
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_in]
+	mov	edx,4
+	call	base64url_encode
+	lea	rdi,[kat_out]
+	mov	esi,eax
+	lea	rdx,[b64_out_fob]
+	mov	ecx,b64_out_fob.len
+	call	same_bytes
+	expect	'base64url encode foob (no pad)'
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_out_fo]
+	mov	edx,b64_out_fo.len
+	call	base64_decode
+	lea	rdi,[kat_out]
+	mov	esi,eax
+	lea	rdx,[b64_in]
+	mov	ecx,2
+	call	same_bytes
+	expect	'base64 decode Zm8='
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_out_fob]
+	mov	edx,b64_out_fob.len
+	call	base64url_decode
+	lea	rdi,[kat_out]
+	mov	esi,eax
+	lea	rdx,[b64_in]
+	mov	ecx,4
+	call	same_bytes
+	expect	'base64url decode Zm9vYg'
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_bad_pad]
+	mov	edx,b64_bad_pad.len
+	call	base64_decode
+	shr	rax,63
+	expect	'base64 rejects bad padding'
+
+	lea	rdi,[kat_out]
+	lea	rsi,[b64_bad_bits]
+	mov	edx,b64_bad_bits.len
+	call	base64_decode
+	shr	rax,63
+	expect	'base64 rejects non-canonical bits'
+	ret
+
+; RFC 7677 section 3: user "user", password "pencil".
+scram_setup:
+	lea	rbx,[kat_scram]
+	lea	rax,[sc_password]
+	mov	[rbx+SC_PASSWORD],rax
+	mov	dword [rbx+SC_PASSWORD_LEN],sc_password.len
+	lea	rax,[sc_nonce]
+	mov	[rbx+SC_NONCE],rax
+	mov	dword [rbx+SC_NONCE_LEN],sc_nonce.len
+	lea	rax,[sc_first]
+	mov	[rbx+SC_FIRST],rax
+	mov	dword [rbx+SC_FIRST_LEN],sc_first.len
+	lea	rax,[sc_server]
+	mov	[rbx+SC_SERVER],rax
+	mov	dword [rbx+SC_SERVER_LEN],sc_server.len
+	ret
+
+scram_tests:
+	push	rbx
+	call	scram_setup
+	mov	rdi,rbx
+	lea	rsi,[kat_msg]
+	call	scram_client_final
+	lea	rdi,[kat_msg]
+	mov	esi,eax
+	lea	rdx,[sc_final]
+	mov	ecx,sc_final.len
+	call	same_bytes
+	expect	'scram-sha-256 client-final rfc7677'
+
+	lea	rdi,[kat_scram]
+	lea	rsi,[sc_verifier]
+	mov	edx,sc_verifier.len
+	call	scram_verify_final
+	expect	'scram-sha-256 server signature accepted'
+
+	lea	rdi,[kat_scram]
+	lea	rsi,[sc_forged]
+	mov	edx,sc_forged.len
+	call	scram_verify_final
+	xor	eax,1
+	expect	'scram-sha-256 forged signature rejected'
+
+	call	scram_setup
+	lea	rax,[sc_bad_nonce]
+	mov	[rbx+SC_SERVER],rax
+	mov	rdi,rbx
+	lea	rsi,[kat_msg]
+	call	scram_client_final
+	shr	rax,63
+	expect	'scram-sha-256 foreign nonce rejected'
+	pop	rbx
+	ret
 
 ; edi = type. Runs the RFC 9106 test vector into kat_out.
 argon2_rfc:
@@ -476,6 +685,39 @@ argon2_stdin:
 	jmp	print_hex_exit
 .invalid:
 	mov	edi,3
+	jmp	exit_process
+
+; kat base64 < u8 mode, data. Modes: 0 encode, 1 encode url, 2 decode,
+; 3 decode url. Prints the result in hex, or "-" when decoding fails.
+base64_stdin:
+	call	read_stdin
+	movzx	eax,byte [kat_big]
+	lea	rsi,[kat_big+1]
+	lea	edx,[rbx-1]
+	lea	rdi,[kat_mem]
+	cmp	eax,1
+	jb	.enc
+	je	.enc_url
+	cmp	eax,2
+	je	.dec
+	call	base64url_decode
+	jmp	.print
+.enc:
+	call	base64_encode
+	jmp	.print
+.enc_url:
+	call	base64url_encode
+	jmp	.print
+.dec:
+	call	base64_decode
+.print:
+	test	rax,rax
+	js	.invalid
+	mov	ecx,eax
+	lea	rsi,[kat_mem]
+	jmp	print_hex_exit
+.invalid:
+	mov	edi,4
 	jmp	exit_process
 
 ; rsi = bytes, ecx = count (<= 1024). Writes them in hex to stderr; exits 0.
