@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Compare build/kat against Python's hashlib/hmac on many input sizes,
-covering every block-boundary case of the streaming code."""
+"""Compare build/kat against reference implementations on many inputs:
+hashlib/hmac for SHA-256, HMAC and BLAKE2b (every block-boundary length),
+and the system libargon2 for Argon2d/i/id over random parameters."""
 import hashlib
 import hmac
 import os
 import random
 import subprocess
+import struct
 import sys
+
+sys.path.insert(0, os.path.dirname(__file__))
+import argon2_ref  # noqa: E402
 
 KAT = os.path.join(os.path.dirname(__file__), "..", "..", "build", "kat")
 
@@ -32,7 +37,31 @@ def main():
         if run("hmac", raw) != hmac.new(key, msg, "sha256").hexdigest():
             print(f"FAIL hmac key {len(key)} msg {len(msg)}")
             failures += 1
-    total = len(sizes) + 300
+    checks = len(sizes) + 300
+    for n in list(range(0, 400)) + [rng.randrange(400, 1_000_000) for _ in range(20)]:
+        outlen = rng.randrange(1, 65)
+        data = rng.randbytes(n)
+        checks += 1
+        if run("blake2b", bytes([outlen]) + data) != hashlib.blake2b(data, digest_size=outlen).hexdigest():
+            print(f"FAIL blake2b length {n} digest {outlen}")
+            failures += 1
+    for _ in range(150):
+        kind = rng.randrange(3)
+        t = rng.randrange(1, 5)
+        p = rng.randrange(1, 5)
+        m = rng.randrange(8 * p, 300)
+        outlen = rng.choice([4, 16, 32, 64, 65, 100, 128, rng.randrange(4, 513)])
+        fields = [rng.randbytes(rng.randrange(0, 80)), rng.randbytes(rng.randrange(8, 40)),
+                  rng.randbytes(rng.choice([0, 0, 8, 32])), rng.randbytes(rng.choice([0, 0, 12]))]
+        raw = struct.pack("<5I", kind, t, m, p, outlen)
+        for f in fields:
+            raw += struct.pack("<I", len(f)) + f
+        want = argon2_ref.argon2(kind, t, m, p, outlen, *fields).hex()
+        checks += 1
+        if run("argon2", raw) != want:
+            print(f"FAIL argon2 type {kind} t={t} m={m} p={p} tag {outlen}")
+            failures += 1
+    total = checks
     print(f"{total - failures}/{total} differential checks passed")
     return 1 if failures else 0
 

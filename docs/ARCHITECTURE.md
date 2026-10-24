@@ -144,6 +144,23 @@ Argon2id is expensive on purpose. It runs in a bounded pool, away from the
 event loop, so logins cannot stall the CRUD path. When the pool is full,
 the server answers 503.
 
+## Crypto
+
+All primitives live in `src/crypto/` and are checked by `build/kat`
+(published test vectors) and `tests/kat/differential.py` (random inputs
+compared with hashlib and the system libargon2, the RFC 9106 reference
+implementation), both part of `make test`.
+
+| Primitive | Implementation | Speed (Zen 3, one core) |
+|---|---|---|
+| SHA-256 | SHA-NI, Intel reference structure | 2.25 GB/s, same as OpenSSL |
+| HMAC-SHA-256, PBKDF2 | key schedule expanded once per key | |
+| BLAKE2b | scalar, 12 rounds unrolled at assembly time | only used inside Argon2 |
+| Argon2d/i/id v1.3 | compression G in AVX2 (four 64-bit lanes per register) | 11 ms for m=19 MiB, t=2, p=1 (libargon2: 14 ms) |
+
+Secrets are compared in constant time, and buffers that held them (hash
+contexts, the Argon2 memory and its stack frame) are wiped before return.
+
 ## Docker
 
 * The build stage fetches fasm2 at a pinned commit and verifies the
@@ -211,8 +228,8 @@ throughput, see `supervisor.inc`).
 | 0 | layout, pinned toolchain, Docker, compose, PostgreSQL, schema | done |
 | 1 | supervisor, workers, io_uring, HTTP/1.1, health endpoints | done |
 | 2 | memory pools, limits, timeouts, graceful shutdown | done |
-| 3 | crypto with known-answer tests: SHA-256 (SHA-NI), HMAC, BLAKE2b, Argon2id, getrandom | next |
-| 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | |
+| 3 | crypto with known-answer tests: SHA-256 (SHA-NI), HMAC, PBKDF2, BLAKE2b, Argon2id, getrandom | done |
+| 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | next |
 | 5 | auth: register, login, refresh, logout | |
 | 6 | notes CRUD, JSON, keyset pagination, If-Match | |
 | 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | |

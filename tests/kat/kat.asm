@@ -14,14 +14,22 @@ include '../../src/core/util.inc'
 include '../../src/crypto/ct.inc'
 include '../../src/crypto/sha256.inc'
 include '../../src/crypto/hmac.inc'
+include '../../src/crypto/blake2b.inc'
+include '../../src/crypto/argon2.inc'
 
 bss
 	align 16
 	kat_failed	dd ?
+	kat_report_len	dd ?
 	kat_out:	rb 64
 	kat_big:	rb 1000000
 	kat_ctx:	rb HMAC_CTX_SIZE
 	kat_hex:	rb 2
+	align 8
+	kat_a2:		rb ARGON2_SIZE
+	kat_hexbuf:	rb 2050
+	align 4096
+	kat_mem:	rb 64 * 1024 * 1024
 end bss
 
 ; Define a test vector: name, input bytes, expected hex digest.
@@ -76,25 +84,33 @@ hexbytes h_4231_2, '5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec
 vector m_4231_6, 'Test Using Larger Than Block-Size Key - Hash Key First'
 hexbytes h_4231_6, '60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54'
 
+hexbytes b2_empty, '786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce'
+hexbytes b2_abc, 'ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d17d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923'
+hexbytes a2_tag_d, '512b391b6f1162975371d30919734294f868e3be3984f3c1a13a4db9fabe4acb'
+hexbytes a2_tag_i, 'c814d9d1dc7f37aa13f0d77f2494bda1c8de6b016dd388d29952a4c4672b6ce8'
+hexbytes a2_tag_id, '0d640df58d78766c08c037a34a8b53c9d01ef0452d75b65eb52520e96b01e659'
 vector p_passwd, 'passwd'
 vector p_password, 'password'
 vector s_salt, 'salt'
 hexbytes dk_passwd_1, '55ac046e56e3089fec1691c22544b605f94185216dde0465e68b9d57c20dacbc'
 hexbytes dk_password_4096, 'c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a'
 
-; Compare kat_out with an expected digest and report.
+; Compare kat_out with an expected value and report.
 macro check name*, expected*
 	local n
 	cstring n, name
 	lea	rsi,[n]
 	mov	edx,n.len
 	lea	rdi,[expected]
+	mov	ecx,expected.len
 	call	report
 end macro
 
 cstring arg_sha256, 'sha256',0
 cstring arg_hmac, 'hmac',0
 cstring arg_bench, 'bench',0
+cstring arg_blake2b, 'blake2b',0
+cstring arg_argon2, 'argon2',0
 
 start:
 	mov	rax,[rsp]
@@ -122,6 +138,18 @@ start:
 	call	cstr_eq
 	test	eax,eax
 	jnz	bench
+	mov	rax,[g_argv]
+	mov	rdi,[rax+8]
+	lea	rsi,[arg_blake2b]
+	call	cstr_eq
+	test	eax,eax
+	jnz	blake2b_stdin
+	mov	rax,[g_argv]
+	mov	rdi,[rax+8]
+	lea	rsi,[arg_argon2]
+	call	cstr_eq
+	test	eax,eax
+	jnz	argon2_stdin
 	mov	edi,2
 	jmp	exit_process
 .vectors:
@@ -219,6 +247,31 @@ start:
 	call	pbkdf2_sha256
 	check	'pbkdf2-sha256 password c=4096', dk_password_4096
 
+	lea	rdi,[kat_out]
+	mov	esi,64
+	lea	rdx,[kat_out]
+	xor	ecx,ecx
+	call	blake2b
+	check	'blake2b-512 empty', b2_empty
+
+	lea	rdi,[kat_out]
+	mov	esi,64
+	lea	rdx,[v_abc]
+	mov	ecx,v_abc.len
+	call	blake2b
+	check	'blake2b-512 abc', b2_abc
+
+	; RFC 9106 section 5: t=3, m=32 KiB, p=4, 32-byte tag, with secret and AD.
+	mov	edi,ARGON2_D
+	call	argon2_rfc
+	check	'argon2d rfc9106', a2_tag_d
+	mov	edi,ARGON2_I
+	call	argon2_rfc
+	check	'argon2i rfc9106', a2_tag_i
+	mov	edi,ARGON2_ID
+	call	argon2_rfc
+	check	'argon2id rfc9106', a2_tag_id
+
 	; getrandom: 64 bytes, not all zero.
 	lea	rdi,[kat_out]
 	mov	ecx,64
@@ -246,6 +299,48 @@ start:
 .finish:
 	mov	edi,[kat_failed]
 	jmp	exit_process
+
+; edi = type. Runs the RFC 9106 test vector into kat_out.
+argon2_rfc:
+	push	rdi
+	lea	rdi,[kat_big]
+	mov	al,1
+	mov	ecx,32
+	rep	stosb
+	mov	al,2
+	mov	ecx,16
+	rep	stosb
+	mov	al,3
+	mov	ecx,8
+	rep	stosb
+	mov	al,4
+	mov	ecx,12
+	rep	stosb
+	pop	rdi
+	lea	rbx,[kat_a2]
+	mov	[rbx+A2_TYPE],edi
+	lea	rax,[kat_out]
+	mov	[rbx+A2_OUT],rax
+	mov	dword [rbx+A2_OUTLEN],32
+	lea	rax,[kat_big]
+	mov	[rbx+A2_PWD],rax
+	mov	dword [rbx+A2_PWDLEN],32
+	add	rax,32
+	mov	[rbx+A2_SALT],rax
+	mov	dword [rbx+A2_SALTLEN],16
+	add	rax,16
+	mov	[rbx+A2_SECRET],rax
+	mov	dword [rbx+A2_SECRETLEN],8
+	add	rax,8
+	mov	[rbx+A2_AD],rax
+	mov	dword [rbx+A2_ADLEN],12
+	mov	dword [rbx+A2_M],32
+	mov	dword [rbx+A2_T],3
+	mov	dword [rbx+A2_P],4
+	lea	rax,[kat_mem]
+	mov	[rbx+A2_MEM],rax
+	mov	rdi,rbx
+	jmp	argon2_hash
 
 ; Differential testing against a reference implementation:
 ;   kat sha256  < data             prints SHA-256(data) in hex
@@ -326,6 +421,92 @@ now_ns:
 	add	rsp,24
 	ret
 
+; kat blake2b < u8 digest length, data
+blake2b_stdin:
+	call	read_stdin
+	movzx	esi,byte [kat_big]
+	push	rsi
+	lea	rdi,[kat_out]
+	lea	rdx,[kat_big+1]
+	lea	ecx,[rbx-1]
+	call	blake2b
+	pop	rcx
+	lea	rsi,[kat_out]
+	jmp	print_hex_exit
+
+; kat argon2 < u32 type, t, m, p, tag length, then u32 length + bytes for
+; password, salt, secret and associated data. Prints the tag in hex.
+argon2_stdin:
+	call	read_stdin
+	lea	rbx,[kat_a2]
+	lea	rsi,[kat_big]
+	mov	eax,[rsi]
+	mov	[rbx+A2_TYPE],eax
+	mov	eax,[rsi+4]
+	mov	[rbx+A2_T],eax
+	mov	eax,[rsi+8]
+	mov	[rbx+A2_M],eax
+	mov	eax,[rsi+12]
+	mov	[rbx+A2_P],eax
+	mov	eax,[rsi+16]
+	mov	[rbx+A2_OUTLEN],eax
+	add	rsi,20
+	irp <field,flen>, A2_PWD,A2_PWDLEN, A2_SALT,A2_SALTLEN, A2_SECRET,A2_SECRETLEN, A2_AD,A2_ADLEN
+		mov	eax,[rsi]
+		mov	[rbx+flen],eax
+		add	rsi,4
+		mov	[rbx+field],rsi
+		add	rsi,rax
+	end irp
+	lea	rax,[kat_hexbuf+1024]		; tag after the hex area's first half
+	mov	[rbx+A2_OUT],rax
+	lea	rax,[kat_mem]
+	mov	[rbx+A2_MEM],rax
+	mov	rdi,rbx
+	call	argon2_hash
+	test	eax,eax
+	jnz	.invalid
+	lea	rsi,[kat_hexbuf+1024]
+	mov	ecx,[kat_a2+A2_OUTLEN]
+	lea	rdi,[kat_big]			; copy the tag out of the hex buffer
+	push	rcx
+	rep	movsb
+	pop	rcx
+	lea	rsi,[kat_big]
+	jmp	print_hex_exit
+.invalid:
+	mov	edi,3
+	jmp	exit_process
+
+; rsi = bytes, ecx = count (<= 1024). Writes them in hex to stderr; exits 0.
+print_hex_exit:
+	lea	rdi,[kat_hexbuf]
+	xor	edx,edx
+.byte:
+	cmp	edx,ecx
+	jae	.write
+	movzx	eax,byte [rsi+rdx]
+	mov	r8d,eax
+	shr	eax,4
+	and	r8d,15
+	mov	al,[hex_digits+rax]
+	mov	[rdi],al
+	mov	al,[hex_digits+r8]
+	mov	[rdi+1],al
+	add	rdi,2
+	inc	edx
+	jmp	.byte
+.write:
+	mov	byte [rdi],10
+	lea	rdx,[rdi+1]
+	lea	rsi,[kat_hexbuf]
+	sub	rdx,rsi
+	mov	edi,2
+	mov	eax,SYS_write
+	syscall
+	xor	edi,edi
+	jmp	exit_process
+
 print_out:
 	mov	dword [g_log_len],0
 	call	log_hex_out
@@ -333,10 +514,13 @@ print_out:
 	xor	edi,edi
 	jmp	exit_process
 
-; Append kat_out (32 bytes) in hex to the log line.
+; Append kat_out (kat_report_len bytes, at most 64) in hex to the log line.
 log_hex_out:
 	push	rbx
 	xor	ebx,ebx
+	cmp	dword [kat_report_len],0
+	jne	.hex
+	mov	dword [kat_report_len],32
 .hex:
 	movzx	eax,byte [kat_out+rbx]
 	mov	ecx,eax
@@ -349,17 +533,19 @@ log_hex_out:
 	mov	edx,2
 	call	log_str
 	inc	ebx
-	cmp	ebx,32
+	cmp	ebx,[kat_report_len]
 	jb	.hex
 	pop	rbx
 	ret
 
-; rsi = name, edx = name length, rdi = expected 32 bytes (vs kat_out).
+; rsi = name, edx = name length, rdi = expected, ecx = its length
+; (compared with kat_out).
 report:
+	mov	[kat_report_len],ecx
 	push	rsi
 	push	rdx
 	lea	rsi,[kat_out]
-	mov	edx,32
+	mov	edx,ecx
 	call	ct_equal
 	push	rax
 	call	log_begin
