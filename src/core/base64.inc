@@ -39,7 +39,8 @@ rodata
 	end repeat
 end rodata
 
-; rdi = destination, rsi = bytes, edx = length. rax = characters written.
+; rdi = destination, rsi = bytes, edx = length. rax = characters written;
+; rdi is left just past them.
 base64_encode:
 	lea	r9,[b64_std]
 	mov	r10d,1				; pad
@@ -47,6 +48,12 @@ base64_encode:
 
 base64url_encode:
 	lea	r9,[b64_url]
+	xor	r10d,r10d
+	jmp	b64_encode
+
+; Standard alphabet without padding (PHC strings).
+base64_encode_nopad:
+	lea	r9,[b64_std]
 	xor	r10d,r10d
 
 ; r9 = alphabet, r10d = 1 to pad with '='.
@@ -136,6 +143,11 @@ base64_decode:
 base64url_decode:
 	lea	r9,[b64_url_dec]
 	xor	r10d,r10d			; padding forbidden
+	jmp	b64_decode
+
+base64_decode_nopad:
+	lea	r9,[b64_std_dec]
+	xor	r10d,r10d
 
 b64_decode:
 	push	rbx

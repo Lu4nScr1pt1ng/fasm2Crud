@@ -18,6 +18,29 @@ include '../../src/crypto/blake2b.inc'
 include '../../src/crypto/argon2.inc'
 include '../../src/core/base64.inc'
 include '../../src/db/scram.inc'
+include '../../src/core/hex.inc'
+include '../../src/http/json.inc'
+include '../../src/crypto/phc.inc'
+include '../../src/app/validate.inc'
+
+; write_u32 lives in the HTTP handler; the tests only need this copy.
+write_u32:
+	sub	rsp,24
+	lea	rsi,[rsp+16]
+	mov	ecx,10
+@@:
+	xor	edx,edx
+	div	ecx
+	add	dl,'0'
+	dec	rsi
+	mov	[rsi],dl
+	test	eax,eax
+	jnz	@b
+	lea	rcx,[rsp+16]
+	sub	rcx,rsi
+	rep	movsb
+	add	rsp,24
+	ret
 
 bss
 	align 16
@@ -131,6 +154,19 @@ cstring arg_bench, 'bench',0
 cstring arg_blake2b, 'blake2b',0
 cstring arg_argon2, 'argon2',0
 cstring arg_b64, 'base64',0
+cstring arg_json, 'json',0
+cstring arg_email, 'email',0
+cstring arg_phc, 'phc',0
+cstring jf_email, 'email'
+cstring jf_password, 'password'
+
+rodata
+	align 8
+	kat_json_spec	dq jf_email
+			dd jf_email.len, EMAIL_MAX
+			dq jf_password
+			dd jf_password.len, PASSWORD_MAX
+end rodata
 
 start:
 	mov	rax,[rsp]
@@ -176,6 +212,24 @@ start:
 	call	cstr_eq
 	test	eax,eax
 	jnz	base64_stdin
+	mov	rax,[g_argv]
+	mov	rdi,[rax+8]
+	lea	rsi,[arg_json]
+	call	cstr_eq
+	test	eax,eax
+	jnz	json_stdin
+	mov	rax,[g_argv]
+	mov	rdi,[rax+8]
+	lea	rsi,[arg_email]
+	call	cstr_eq
+	test	eax,eax
+	jnz	email_stdin
+	mov	rax,[g_argv]
+	mov	rdi,[rax+8]
+	lea	rsi,[arg_phc]
+	call	cstr_eq
+	test	eax,eax
+	jnz	phc_stdin
 	mov	edi,2
 	jmp	exit_process
 .vectors:
@@ -718,6 +772,110 @@ base64_stdin:
 	jmp	print_hex_exit
 .invalid:
 	mov	edi,4
+	jmp	exit_process
+
+; kat json < body: parses {email, password}. Prints, in hex: the result
+; code, then per field: present (1 byte), length (2 bytes LE), bytes.
+json_stdin:
+	call	read_stdin
+	lea	rdi,[kat_a2]			; reused as the job
+	lea	rax,[kat_json_spec]
+	mov	[rdi+JJ_SPEC],rax
+	lea	rax,[kat_hexbuf]		; results (2 x 16 bytes)
+	mov	[rdi+JJ_OUT],rax
+	lea	rax,[kat_mem+65536]
+	mov	[rdi+JJ_SCRATCH],rax
+	mov	dword [rdi+JJ_SCRATCH_CAP],EMAIL_MAX + PASSWORD_MAX
+	lea	rax,[kat_big]
+	mov	[rdi+JJ_BODY],rax
+	mov	[rdi+JJ_BODY_LEN],ebx
+	mov	dword [rdi+JJ_FIELDS],2
+	call	json_parse_object
+	test	eax,eax
+	jz	@f
+	; Results are only meaningful on success.
+	push	rax
+	lea	rdi,[kat_hexbuf]
+	xor	eax,eax
+	mov	ecx,32
+	rep	stosb
+	pop	rax
+@@:
+	lea	rdi,[kat_mem]
+	mov	[rdi],al
+	inc	rdi
+	xor	ebx,ebx
+.field:
+	mov	eax,ebx
+	shl	eax,4
+	lea	rdx,[kat_hexbuf+rax]
+	mov	eax,[rdx+JV_PRESENT]
+	mov	[rdi],al
+	mov	ecx,[rdx+JV_LEN]
+	mov	[rdi+1],cx
+	add	rdi,3
+	mov	rsi,[rdx+JV_PTR]
+	rep	movsb
+	inc	ebx
+	cmp	ebx,2
+	jb	.field
+	lea	rsi,[kat_mem]
+	mov	rcx,rdi
+	sub	rcx,rsi
+	jmp	print_hex_exit
+
+; kat email < address: prints "01" + normalized address, or "00".
+email_stdin:
+	call	read_stdin
+	lea	rdi,[kat_big]
+	mov	esi,ebx
+	call	email_normalize
+	mov	[kat_mem],al
+	lea	rdi,[kat_mem+1]
+	lea	rsi,[kat_big]
+	mov	ecx,ebx
+	rep	movsb
+	lea	ecx,[rbx+1]
+	test	al,al
+	jnz	@f
+	mov	ecx,1
+@@:
+	lea	rsi,[kat_mem]
+	jmp	print_hex_exit
+
+; kat phc < 'e' + 16-byte salt + 32-byte hash: encodes, decodes the result
+; back and prints the string, or exits 5 when the round trip disagrees.
+; kat phc < 'd' + string: prints m, t, p, salt and hash, or exits 5.
+phc_stdin:
+	call	read_stdin
+	cmp	byte [kat_big],'d'
+	je	.decode
+	lea	rdi,[kat_mem]
+	lea	rsi,[kat_big+1]
+	lea	rdx,[kat_big+17]
+	call	phc_encode
+	mov	ebx,eax
+	lea	rsi,[kat_mem]
+	mov	edx,ebx
+	lea	rdi,[kat_mem+4096]
+	call	phc_decode
+	test	eax,eax
+	jnz	.fail
+	lea	rsi,[kat_mem]
+	mov	ecx,ebx
+	jmp	print_hex_exit
+.decode:
+	lea	rsi,[kat_big+1]
+	lea	edx,[rbx-1]
+	lea	rdi,[kat_mem+4096]
+	call	phc_decode
+	test	eax,eax
+	jnz	.fail
+	lea	rsi,[kat_mem+4096]
+	mov	ecx,PHC_HASH + 32
+	jmp	print_hex_exit
+.fail:
+	mov	edi,5
 	jmp	exit_process
 
 ; rsi = bytes, ecx = count (<= 1024). Writes them in hex to stderr; exits 0.

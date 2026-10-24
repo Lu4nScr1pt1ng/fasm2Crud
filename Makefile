@@ -32,6 +32,7 @@ run: $(BIN)
 test: $(BIN) $(KAT)
 	./$(KAT)
 	python3 -I tests/kat/differential.py
+	python3 -I tests/kat/differential_input.py
 	./tests/smoke.sh
 
 itest: $(BIN)
