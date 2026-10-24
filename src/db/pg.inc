@@ -69,6 +69,7 @@ PG_SIZE		= PG_RX + PG_RX_CAP
 PQ_SLOT		= 0
 PQ_GEN		= 4
 PQ_CONT		= 8
+PQ_CTX		= 12		; auth context id + 1, or 0
 PQ_SIZE		= 16
 
 PG_NONCE_BYTES	= 18		; 24 base64 characters, no padding
@@ -113,7 +114,7 @@ virtual at 0
 end virtual
 PGSTMT.count = 0
 
-macro pg_statement id*, sql*
+macro pg_statement id*, sql&
 	local n, q
 	cstring n, 's', '0' + PGSTMT.count / 10, '0' + PGSTMT.count mod 10, 0
 	cstring q, sql, 0
@@ -125,6 +126,32 @@ macro pg_statement id*, sql*
 end macro
 
 pg_statement STMT_PING, 'SELECT 1'
+pg_statement STMT_INSERT_USER, 'INSERT INTO users (email, password_hash) VALUES ($1, $2) RETURNING id'
+pg_statement STMT_USER_BY_EMAIL, 'SELECT id, password_hash, session_epoch FROM users WHERE email = $1'
+pg_statement STMT_INSERT_REFRESH, \
+	'INSERT INTO refresh_tokens (token_hash, user_id, family_id, expires_at) ', \
+	'VALUES ($1::bytea, $2::uuid, uuidv7(), now() + interval ''30 days'')'
+; Rotation in one statement. The row lock serializes two refreshes of the
+; same token; the loser sees it rotated, which counts as reuse and revokes
+; the whole family (every token of that login). A family with any revoked
+; token never rotates again: that also covers the winner's new token, which
+; the loser's snapshot cannot see, and a logout racing a refresh.
+pg_statement STMT_ROTATE_REFRESH, \
+	'WITH t AS (SELECT token_hash, user_id, family_id, rotated_at, revoked_at, expires_at ', \
+	'FROM refresh_tokens WHERE token_hash = $1::bytea FOR UPDATE), ', \
+	'rot AS (UPDATE refresh_tokens r SET rotated_at = now() FROM t ', \
+	'WHERE r.token_hash = t.token_hash AND t.rotated_at IS NULL AND t.revoked_at IS NULL ', \
+	'AND t.expires_at > now() AND NOT EXISTS (SELECT 1 FROM refresh_tokens x ', \
+	'WHERE x.family_id = t.family_id AND x.revoked_at IS NOT NULL) ', \
+	'RETURNING r.user_id, r.family_id), ', \
+	'reuse AS (UPDATE refresh_tokens r SET revoked_at = now() FROM t ', \
+	'WHERE r.family_id = t.family_id AND t.rotated_at IS NOT NULL AND r.revoked_at IS NULL RETURNING 1), ', \
+	'ins AS (INSERT INTO refresh_tokens (token_hash, user_id, family_id, expires_at) ', \
+	'SELECT $2::bytea, user_id, family_id, now() + interval ''30 days'' FROM rot RETURNING user_id) ', \
+	'SELECT u.id, u.session_epoch FROM ins JOIN users u ON u.id = ins.user_id'
+pg_statement STMT_REVOKE_FAMILY, \
+	'UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = ', \
+	'(SELECT family_id FROM refresh_tokens WHERE token_hash = $1::bytea) AND revoked_at IS NULL'
 
 rodata
 	align 8
@@ -858,8 +885,9 @@ pg_log_error:
 ; Hand a finished query to its continuation.
 ; r13 = connection, eax = PGR_xxx, rsi = first reply message, rdx = end.
 ; The continuation runs with rbx = HTTP slot, r12 = HTTP connection,
-; rsi/rdx = reply range, eax = status; afterwards the HTTP connection
-; resumes parsing. Replies for connections that went away are dropped.
+; rsi/rdx = reply range, eax = status, ecx = context (id + 1, or 0);
+; afterwards the HTTP connection resumes parsing. Replies for connections
+; that went away are dropped, and their context is released.
 pg_deliver:
 	push	rbx
 	push	r12
@@ -876,6 +904,7 @@ pg_deliver:
 	inc	eax
 	mov	[r13+PG_QHEAD],eax
 	mov	ebx,[r9+PQ_SLOT]
+	mov	r10d,[r9+PQ_CTX]
 	cmp	ebx,[g_max_conns]
 	jae	.dropped
 	conn_ptr r12,rbx
@@ -886,19 +915,27 @@ pg_deliver:
 	jne	.dropped
 	test	dword [r12+C_FLAGS],F_WAIT_DB
 	jz	.dropped
+	; Cleared before the continuation, which may wait again (another
+	; query, a password hash).
+	and	dword [r12+C_FLAGS],not F_WAIT_DB
 	mov	eax,[r13+PG_SQLSTATE]
 	mov	dword [g_pg_sqlstate],eax
 	mov	al,[r13+PG_SQLSTATE+4]
 	mov	byte [g_pg_sqlstate+4],al
-	mov	ecx,[r9+PQ_CONT]
+	mov	r11d,[r9+PQ_CONT]
+	mov	ecx,r10d
 	mov	rsi,r14
 	mov	rdx,r15
 	mov	eax,r8d
 	push	r13
-	call	qword [pg_cont_tbl+rcx*8]
+	call	qword [pg_cont_tbl+r11*8]
 	call	http_resume
 	pop	r13
+	jmp	.done
 .dropped:
+	mov	edi,r10d
+	call	auth_ctx_free
+.done:
 	pop	r15
 	pop	r14
 	pop	r12
@@ -908,7 +945,8 @@ pg_deliver:
 ; Run a prepared statement for the current HTTP request.
 ; rbx = HTTP slot, r12 = HTTP connection, edi = STMT_xxx, esi = CONT_xxx,
 ; rdx = parameters (16 bytes each: dq pointer, dd length or -1 for NULL),
-; ecx = parameter count.
+; ecx = parameter count, r8d = context (id + 1, or 0) handed back to the
+; continuation.
 ; eax = 0 when queued (the connection waits, F_WAIT_DB), -1 when no
 ; database connection can take it right now (answer 503).
 db_query:
@@ -916,6 +954,7 @@ db_query:
 	push	r14
 	push	r15
 	push	rbp
+	push	r8				; the context, until it is queued
 	mov	r14d,edi
 	mov	r15d,esi
 	mov	rbp,rdx
@@ -1022,6 +1061,8 @@ db_query:
 	mov	ecx,[r12+C_GEN]
 	mov	[rsi+PQ_GEN],ecx
 	mov	[rsi+PQ_CONT],r15d
+	mov	ecx,[rsp]
+	mov	[rsi+PQ_CTX],ecx
 	inc	eax
 	mov	[r13+PG_QTAIL],eax
 	or	dword [r12+C_FLAGS],F_WAIT_DB
@@ -1035,6 +1076,7 @@ db_query:
 .unavailable:
 	mov	eax,-1
 .done:
+	pop	r8
 	pop	rbp
 	pop	r15
 	pop	r14
@@ -1210,6 +1252,54 @@ pg_tick:
 	pop	r13
 	pop	rbx
 .done:
+	ret
+
+; Column of the first DataRow in a reply range.
+; rsi = first message, rdx = end, ecx = column.
+; rax = value, edx = length. CF when there is no row or the value is NULL.
+pg_row_field:
+	push	rbx
+	mov	rbx,rdx
+.message:
+	lea	rax,[rsi+5]
+	cmp	rax,rbx
+	ja	.none
+	mov	eax,[rsi+1]
+	bswap	eax
+	lea	r8,[rsi+rax+1]			; next message
+	cmp	byte [rsi],'D'
+	je	.row
+	mov	rsi,r8
+	jmp	.message
+.row:
+	movzx	edx,word [rsi+5]
+	xchg	dl,dh
+	cmp	ecx,edx
+	jae	.none
+	add	rsi,7
+.column:
+	mov	eax,[rsi]
+	bswap	eax
+	add	rsi,4
+	test	ecx,ecx
+	jz	.found
+	test	eax,eax
+	js	@f				; NULL: no bytes follow
+	add	rsi,rax
+@@:
+	dec	ecx
+	jmp	.column
+.found:
+	test	eax,eax
+	js	.none
+	mov	edx,eax
+	mov	rax,rsi
+	pop	rbx
+	clc
+	ret
+.none:
+	pop	rbx
+	stc
 	ret
 
 ; eax = 1 when at least one connection is ready.

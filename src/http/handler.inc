@@ -5,6 +5,7 @@ cstring hdr_common, 'Content-Type: application/json',13,10, \
 		    'Cache-Control: no-store',13,10, \
 		    'Content-Length: '
 cstring hdr_close, 'Connection: close',13,10
+cstring hdr_no_store, 'Cache-Control: no-store',13,10
 
 ; r12 = connection, rdi = request start, esi = bytes available.
 ; eax = bytes consumed by one request, or 0 when more data is needed.
@@ -155,6 +156,35 @@ respond:
 	pop	r15
 	pop	r14
 	pop	r13
+	ret
+
+; 204: no body, and so no Content-Type or Content-Length (RFC 9110 8.6).
+; r12 = connection.
+respond_no_content:
+	mov	eax,[r12+C_OUT_LEN]
+	lea	rdi,[r12+OUT_OFF+rax]
+	mov	eax,ST_204
+	shl	eax,5
+	mov	rsi,[status_tbl+rax]
+	mov	rcx,[status_tbl+rax+8]
+	rep	movsb
+	lea	rsi,[g_date_line]
+	mov	ecx,DATE_LINE_LEN
+	rep	movsb
+	lea	rsi,[hdr_no_store]
+	mov	ecx,hdr_no_store.len
+	rep	movsb
+	test	dword [r12+C_FLAGS],F_CLOSE_AFTER
+	jz	@f
+	lea	rsi,[hdr_close]
+	mov	ecx,hdr_close.len
+	rep	movsb
+@@:
+	mov	word [rdi],0x0A0D
+	add	rdi,2
+	lea	rax,[r12+OUT_OFF]
+	sub	rdi,rax
+	mov	[r12+C_OUT_LEN],edi
 	ret
 
 ; eax = value, rdi = destination; rdi is advanced past the digits.

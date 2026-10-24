@@ -12,14 +12,17 @@ SYS_rt_sigprocmask	= 14
 SYS_nanosleep		= 35
 SYS_getpid		= 39
 SYS_socket		= 41
+SYS_sendto		= 44
 SYS_connect		= 42
 SYS_bind		= 49
 SYS_listen		= 50
+SYS_socketpair		= 53
 SYS_setsockopt		= 54
 SYS_fork		= 57
 SYS_exit		= 60
 SYS_kill		= 62
 SYS_getppid		= 110
+SYS_setpriority		= 141
 SYS_prctl		= 157
 SYS_sched_setaffinity	= 203
 SYS_sched_getaffinity	= 204
@@ -27,11 +30,13 @@ SYS_clock_gettime	= 228
 SYS_exit_group		= 231
 SYS_waitid		= 247
 SYS_signalfd4		= 289
+SYS_dup3		= 292
 SYS_prlimit64		= 302
 SYS_getrandom		= 318
 SYS_io_uring_setup	= 425
 SYS_io_uring_enter	= 426
 SYS_io_uring_register	= 427
+SYS_close_range		= 436
 
 ; errno
 EINTR		= 4
@@ -75,7 +80,11 @@ SI_STATUS	= 24
 
 ; prctl
 PR_SET_PDEATHSIG = 1
+PR_SET_DUMPABLE	 = 4
 PR_SET_NAME	 = 15
+PR_SET_SECCOMP	 = 22
+SECCOMP_MODE_STRICT = 1
+PRIO_PROCESS	 = 0
 
 ; resource limits
 RLIMIT_NOFILE	= 7
@@ -85,8 +94,10 @@ CLOCK_REALTIME	= 0
 CLOCK_MONOTONIC	= 1
 
 ; sockets
+AF_UNIX		= 1
 AF_INET		= 2
 SOCK_STREAM	= 1
+SOCK_SEQPACKET	= 5
 SOCK_CLOEXEC	= 0x80000
 SOL_SOCKET	= 1
 SO_REUSEADDR	= 2
@@ -102,5 +113,6 @@ TCP_KEEPINTVL	= 5
 TCP_KEEPCNT	= 6
 TCP_USER_TIMEOUT = 18
 SHUT_WR		= 1
+MSG_DONTWAIT	= 0x40
 MSG_NOSIGNAL	= 0x4000
 INADDR_LOOPBACK	= 0x0100007F	; 127.0.0.1 in network byte order

@@ -233,12 +233,14 @@ OP_PG_CONNECT	= 6
 OP_PG_RECV	= 7
 OP_PG_SEND	= 8
 OP_PG_TIMER	= 9
-OP_COUNT	= 10
+OP_HASHER	= 10
+OP_COUNT	= 11
 
 rodata
 	align 8
 	dispatch_tbl	dq on_accept, on_recv, on_send, on_timer, on_signal, on_ignore
 			dq on_pg_connect, on_pg_recv, on_pg_send, on_pg_timer
+			dq on_hasher
 end rodata
 
 ring_reap:

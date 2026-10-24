@@ -34,7 +34,7 @@ F_SEND		= 1 shl 1
 F_WAIT_OUT	= 1 shl 2
 F_CLOSE_AFTER	= 1 shl 3
 F_LINGER	= 1 shl 4
-F_WAIT_DB	= 1 shl 5	; a database reply will answer the current request
+F_WAIT_DB	= 1 shl 5	; a database or hasher reply will answer the current request
 
 macro conn_ptr reg*, slot*
 	mov	reg,slot
@@ -305,7 +305,8 @@ conn_flush:
 	mov	eax,[r12+C_FLAGS]
 	test	eax,F_CLOSE_AFTER
 	jz	.read_more
-	test	eax,F_SEND or F_LINGER
+	; The last response may still be owed by the database or the hasher.
+	test	eax,F_SEND or F_LINGER or F_WAIT_DB
 	jnz	.done
 	jmp	start_linger
 .read_more:
@@ -386,9 +387,9 @@ conn_release:
 	mov	[g_free_top],eax
 	ret
 
-; A database reply answered the current request: carry on with the input.
+; A database or hasher reply was handled (F_WAIT_DB is clear unless the
+; request waits again): carry on with the input.
 http_resume:
-	and	dword [r12+C_FLAGS],not F_WAIT_DB
 	call	process_input
 	jmp	conn_flush
 

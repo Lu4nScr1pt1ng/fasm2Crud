@@ -45,6 +45,13 @@ worker_main:
 	lea	rsi,[worker_name]
 	mov	eax,SYS_prctl
 	syscall
+	; The password hasher is our child: let the kernel reap it.
+	mov	edi,SIGCHLD
+	lea	rsi,[sigact_ignore]
+	xor	edx,edx
+	mov	r10d,8
+	mov	eax,SYS_rt_sigaction
+	syscall
 
 	mov	edi,ebx
 	call	pin_to_cpu
@@ -76,6 +83,8 @@ worker_main:
 	js	.no_files
 
 	call	date_init
+	call	auth_ctx_init
+	call	hasher_tick
 	call	pg_init
 	call	arm_accept
 	call	arm_timer
@@ -249,6 +258,7 @@ on_timer:
 	inc	dword [g_tick]
 	call	date_update
 	call	pg_tick
+	call	hasher_tick
 
 	cmp	dword [g_accept_paused],0
 	je	.sweep_start

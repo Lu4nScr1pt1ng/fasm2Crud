@@ -20,6 +20,7 @@ cstring env_db_user, 'API_DB_USER='
 cstring env_db_name, 'API_DB_NAME='
 cstring env_db_password, 'API_DB_PASSWORD='
 cstring env_db_conns, 'API_DB_CONNS='
+cstring env_token_key, 'API_TOKEN_KEY='
 cstring default_db_user, 'api'
 cstring default_db_name, 'fasm2crud'
 
@@ -61,6 +62,8 @@ start:
 ;   API_DB_NAME    (default fasm2crud)
 ;   API_DB_PASSWORD  required with API_DB_HOST
 ;   API_DB_CONNS   connections per worker (default 2)
+;   API_TOKEN_KEY  base64url of the 32-byte access token key; when unset a
+;                  random key is made at startup (tokens die with the process)
 config_load:
 	; CPUs available to us, honouring cgroup cpusets and taskset.
 	xor	edi,edi
@@ -120,7 +123,52 @@ config_load:
 	mov	r8d,1000000
 	call	env_uint
 	mov	[g_busy_poll_us],eax
+	call	config_token_key
 	jmp	config_db
+
+; The key is read (or made) before the workers fork, so all share it.
+config_token_key:
+	lea	rdi,[env_token_key]
+	mov	esi,env_token_key.len
+	call	getenv
+	test	rax,rax
+	jz	.random
+	mov	rsi,rax
+	xor	edx,edx
+@@:
+	cmp	byte [rsi+rdx],0
+	je	@f
+	inc	edx
+	cmp	edx,64
+	jb	@b
+@@:
+	cmp	edx,43
+	jne	.bad
+	lea	rdi,[g_token_key]
+	call	base64url_decode
+	cmp	rax,32
+	jne	.bad
+	ret
+.random:
+	lea	rdi,[g_token_key]
+	mov	esi,32
+	call	random_bytes
+	test	eax,eax
+	jnz	.bad
+	; The healthcheck subcommand has no use for a key; stay quiet there.
+	cmp	qword [g_argc],2
+	jae	.done
+	call	log_begin
+	log_lit 'API_TOKEN_KEY is not set: using a random key, tokens will not survive a restart'
+	call	log_end
+.done:
+	ret
+.bad:
+	call	log_begin
+	log_lit 'API_TOKEN_KEY must be 32 random bytes in base64url (43 characters)'
+	call	log_end
+	mov	edi,EXIT_CONFIG
+	jmp	exit_process
 
 ; Database settings. Strings point into the environment block.
 config_db:

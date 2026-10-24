@@ -171,7 +171,7 @@ was back 0.4 s after PostgreSQL. One connection per worker gives the most
 throughput, because more queries share each packet; two (the default)
 give a better tail and survive the loss of one.
 
-## Authentication (planned)
+## Authentication
 
 | Piece | Choice | Why |
 |---|---|---|
@@ -181,9 +181,48 @@ give a better tail and survive the loss of one.
 | Signatures (ML-DSA) | not used for tokens | only useful when third parties verify tokens; 2.4 KB signatures for no gain here |
 | Transport | TLS 1.3 with X25519MLKEM768, terminated at the edge | protects against harvest-now-decrypt-later |
 
-Argon2id is expensive on purpose. It runs in a bounded pool, away from the
-event loop, so logins cannot stall the CRUD path. When the pool is full,
-the server answers 503.
+### Endpoints (`src/app/auth.inc`)
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `POST /v1/auth/register` | `email`, `password` | 201 `{"id","email"}`, 409 when taken |
+| `POST /v1/auth/login` | `email`, `password` | 200 tokens, 401 |
+| `POST /v1/auth/refresh` | `refresh_token` | 200 new tokens, 401; the old token is spent |
+| `POST /v1/auth/logout` | `refresh_token` | 204; ends that login (the whole family) |
+
+Bodies are strict JSON (`application/json`, else 415): malformed is 400,
+a wrong shape or an unacceptable address or password is 422. Addresses
+are lowercased. A wrong password and an unknown address get the same 401
+after the same work: unknown addresses are hashed against a dummy salt.
+Reusing a spent refresh token revokes its family, and a family with any
+revoked token never rotates again, which also covers two refreshes racing
+for the same token and a logout racing a refresh. `API_TOKEN_KEY` (32
+bytes, base64url) signs access tokens; without it the supervisor makes a
+random key, shared by the workers, that dies with the process.
+
+A request keeps its state in an auth context (a fixed pool of 128 per
+worker, wiped on release) across its hasher and database round trips;
+while it waits, its HTTP connection stops reading, exactly as for a query.
+
+### The hasher process
+
+Argon2id is expensive on purpose (11 ms and 19 MiB per hash), so it never
+runs on the event loop. Each worker forks a hasher and talks to it over a
+`SOCK_SEQPACKET` socketpair: one message per job, one per reply, and the
+replies are read through the worker's ring. The hasher:
+
+* runs at nice 10 on any CPU of the service, so a worker with requests to
+  serve wins its CPU back;
+* keeps only its socket, cannot be dumped or traced (`PR_SET_DUMPABLE` 0),
+  and enters seccomp strict mode before its first job: from then on it can
+  read, write and exit, nothing else. Memory is reserved before that;
+* dies with its worker. If it dies first, its jobs are answered with 503
+  at once and a new hasher starts on the next tick.
+
+At most 16 jobs wait per worker; beyond that, auth requests get 503 with
+`Retry-After: 1`. Measured with one worker and 100 concurrent logins: 16
+accepted, 84 refused with 503, and `GET /healthz` on the same worker kept a
+0.08 ms median (0.25 ms max) while the hashes ran.
 
 ## Crypto
 
@@ -272,8 +311,8 @@ throughput, see `supervisor.inc`).
 | 2 | memory pools, limits, timeouts, graceful shutdown | done |
 | 3 | crypto with known-answer tests: SHA-256 (SHA-NI), HMAC, PBKDF2, BLAKE2b, Argon2id, getrandom | done |
 | 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | done |
-| 5 | auth: register, login, refresh, logout | next |
-| 6 | notes CRUD, JSON, keyset pagination, If-Match | |
+| 5 | auth: register, login, refresh, logout, isolated hasher process | done |
+| 6 | notes CRUD, JSON, keyset pagination, If-Match | next |
 | 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | |
 | 8 | stress tests, `perf`, tuning | |
 | 9 (optional) | TLS 1.3 with ML-KEM in assembly | |

@@ -21,7 +21,13 @@ macro http_status id*, line*, body*
 end macro
 
 http_status ST_200, 'HTTP/1.1 200 OK',				'{"status":"ok"}'
+http_status ST_201, 'HTTP/1.1 201 Created',			'{}'
+http_status ST_204, 'HTTP/1.1 204 No Content',			''
 http_status ST_400, 'HTTP/1.1 400 Bad Request',			'{"error":"bad_request"}'
+http_status ST_401, 'HTTP/1.1 401 Unauthorized',		'{"error":"unauthorized"}'
+http_status ST_409, 'HTTP/1.1 409 Conflict',			'{"error":"conflict"}'
+http_status ST_415, 'HTTP/1.1 415 Unsupported Media Type',	'{"error":"unsupported_media_type"}'
+http_status ST_422, 'HTTP/1.1 422 Unprocessable Content',	'{"error":"invalid_body"}'
 http_status ST_404, 'HTTP/1.1 404 Not Found',			'{"error":"not_found"}'
 http_status ST_405, 'HTTP/1.1 405 Method Not Allowed',		'{"error":"method_not_allowed"}'
 http_status ST_413, 'HTTP/1.1 413 Content Too Large',		'{"error":"payload_too_large"}'

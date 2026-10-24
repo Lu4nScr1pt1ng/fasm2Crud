@@ -6,10 +6,16 @@ cstring body_db_unavailable, '{"error":"database_unavailable"}'
 
 ; Continuations for database replies (see pg_deliver), indexed by CONT_xxx.
 CONT_READY	= 0
+CONT_REGISTER	= 1
+CONT_LOGIN_USER	= 2
+CONT_LOGIN_TOKEN = 3
+CONT_REFRESH	= 4
+CONT_LOGOUT	= 5
 
 rodata
 	align 8
-	pg_cont_tbl	dq cont_ready
+	pg_cont_tbl	dq cont_ready, cont_register, cont_login_user, cont_login_token
+			dq cont_refresh, cont_logout
 end rodata
 
 ; r12 = connection; g_req holds the parsed request.
@@ -22,9 +28,19 @@ route:
 	je	.len8
 	cmp	eax,7
 	je	.len7
+	cmp	eax,9
+	ja	.long
 .not_found:
 	mov	edi,ST_404
 	jmp	respond_status
+
+.long:
+	mov	rcx,'/v1/auth'
+	cmp	[rsi],rcx
+	jne	.not_found
+	cmp	byte [rsi+8],'/'
+	jne	.not_found
+	jmp	auth_route
 
 .len8:
 	mov	rax,'/healthz'

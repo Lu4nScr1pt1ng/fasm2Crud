@@ -25,6 +25,7 @@ date_update:
 	syscall
 	mov	rax,[rsp]
 	add	rsp,24
+	mov	[g_unix_now],rax
 	lea	rdi,[g_date_line+6]
 	jmp	format_http_date
 
