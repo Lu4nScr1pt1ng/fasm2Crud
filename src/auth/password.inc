@@ -10,9 +10,11 @@
 ; The hasher
 ;   * runs at nice 10 on any CPU of the process, so the worker wins its own
 ;     CPU back whenever it has work;
-;   * keeps only its socket open, cannot be traced or dumped, and enters
-;     seccomp strict mode before the first job: from then on the kernel
-;     lets it read, write and exit, nothing else;
+;   * keeps only its socket open, cannot be traced or dumped, and installs
+;     a seccomp filter before the first job: from then on the kernel lets
+;     it read, write and exit, and kills it for any other system call.
+;     (Strict mode would say the same, but it cannot be entered under a
+;     filter that is already there, such as Docker's; filters stack.)
 ;   * dies with its worker (PR_SET_PDEATHSIG). If it dies first, its jobs
 ;     are answered with 503 and a new hasher starts on the next tick.
 ;
@@ -62,6 +64,42 @@ rodata
 	align 16
 	pw_dummy_salt	db PW_SALT_LEN dup 0
 	hasher_name	db 'fasm2crud-h',0
+	; struct sock_filter: dw code, db jt, jf, dd k.
+	hasher_filter:
+	dw 0x20
+	db 0, 0
+	dd 4				; ld arch
+	dw 0x15
+	db 1, 0
+	dd AUDIT_ARCH_X86_64		; jeq -> ld nr
+	dw 0x06
+	db 0, 0
+	dd SECCOMP_RET_KILL_PROCESS
+	dw 0x20
+	db 0, 0
+	dd 0				; ld nr
+	dw 0x15
+	db 4, 0
+	dd SYS_read
+	dw 0x15
+	db 3, 0
+	dd SYS_write
+	dw 0x15
+	db 2, 0
+	dd SYS_exit
+	dw 0x15
+	db 1, 0
+	dd SYS_exit_group
+	dw 0x06
+	db 0, 0
+	dd SECCOMP_RET_KILL_PROCESS
+	dw 0x06
+	db 0, 0
+	dd SECCOMP_RET_ALLOW
+	HASHER_FILTER_LEN = ($ - hasher_filter) / 8
+	align 8
+	hasher_fprog	dw HASHER_FILTER_LEN, 0, 0, 0
+			dq hasher_filter
 end rodata
 
 ; ---------------------------------------------------------------- worker side
@@ -374,20 +412,24 @@ hasher_main:
 	jae	.no_memory
 	mov	[g_pw_mem],rax
 
-	mov	edi,PR_SET_SECCOMP
-	mov	esi,SECCOMP_MODE_STRICT
+	; Without the filter the hasher does not serve: the worker answers
+	; 503 for auth and retries every tick, and the log says why.
+	mov	edi,PR_SET_NO_NEW_PRIVS
+	mov	esi,1
+	xor	edx,edx
+	xor	r10d,r10d
+	xor	r8d,r8d
 	mov	eax,SYS_prctl
 	syscall
 	test	eax,eax
-	jz	.serve
-	push	rax
-	call	log_begin
-	log_lit 'password hasher: seccomp strict mode unavailable (errno '
-	pop	rax
-	neg	rax
-	call	log_u64
-	log_lit '), running without it'
-	call	log_end
+	js	.no_filter
+	mov	edi,PR_SET_SECCOMP
+	mov	esi,SECCOMP_MODE_FILTER
+	lea	rdx,[hasher_fprog]
+	mov	eax,SYS_prctl
+	syscall
+	test	eax,eax
+	js	.no_filter
 
 .serve:
 	mov	edi,3
@@ -416,7 +458,7 @@ hasher_main:
 	cmp	rax,HR_SIZE
 	je	.serve
 .exit:
-	; exit, not exit_group: strict mode allows only the former.
+	; exit is enough for a single-threaded process, and the filter allows it.
 	xor	edi,edi
 	mov	eax,SYS_exit
 	syscall
@@ -424,6 +466,16 @@ hasher_main:
 .no_memory:
 	call	log_begin
 	log_lit 'password hasher: cannot reserve its memory'
+	call	log_end
+	jmp	.exit
+.no_filter:
+	push	rax
+	call	log_begin
+	log_lit 'password hasher: cannot install its seccomp filter (errno '
+	pop	rax
+	neg	rax
+	call	log_u64
+	log_lit ')'
 	call	log_end
 	jmp	.exit
 

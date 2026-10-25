@@ -162,6 +162,29 @@ json_content_type:
 .done:
 	ret
 
+; The current request's "Authorization: Bearer <token>" (scheme in any
+; case). rdi = user id (16 bytes). eax = session epoch; CF when the header
+; is missing or the token is not valid.
+request_bearer:
+	mov	rsi,[req_auth]
+	mov	edx,[req_auth_len]
+	cmp	edx,7
+	jbe	.bad
+	mov	eax,[rsi]
+	or	eax,0x20202020
+	cmp	eax,'bear'
+	jne	.bad
+	mov	eax,[rsi+3]
+	or	eax,0x20202020			; ' ' | 0x20 is still ' '
+	cmp	eax,'rer '
+	jne	.bad
+	add	rsi,7
+	sub	edx,7
+	jmp	access_token_verify
+.bad:
+	stc
+	ret
+
 ; Parse the body into g_auth_vals. rdi = field spec, esi = field count;
 ; every field is required. eax = 0, or the ST_xxx to answer.
 auth_parse:

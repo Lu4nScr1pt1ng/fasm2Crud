@@ -22,6 +22,8 @@ include '../../src/core/hex.inc'
 include '../../src/http/json.inc'
 include '../../src/crypto/phc.inc'
 include '../../src/app/validate.inc'
+include '../../src/auth/ctx.inc'
+include '../../src/auth/token.inc'
 
 ; write_u32 lives in the HTTP handler; the tests only need this copy.
 write_u32:
@@ -380,8 +382,96 @@ start:
 	call	log_end
 	mov	dword [kat_failed],1
 .finish:
+	call	token_tests
 	mov	edi,[kat_failed]
 	jmp	exit_process
+
+rodata
+	kt_user	db 0x01,0x8f,0x2a,0x11,0x22,0x33,0x74,0x44,0x85,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb
+end rodata
+
+; Access tokens: round trip, then every way a token must be refused.
+; [rsp] user out, [rsp+16] token length, [rsp+32] token.
+token_tests:
+	push	rbx
+	sub	rsp,128
+	lea	rdi,[g_token_key]
+	mov	al,0x42
+	mov	ecx,32
+	rep	stosb
+	mov	qword [g_unix_now],1700000000
+	lea	rdi,[rsp+32]
+	lea	rsi,[kt_user]
+	mov	edx,7
+	call	access_token_make
+	mov	[rsp+16],eax
+	cmp	eax,ACCESS_TOKEN_LEN
+	sete	al
+	movzx	eax,al
+	expect	'access token length'
+
+	call	.verify
+	setnc	bl
+	cmp	eax,7
+	sete	al
+	and	bl,al
+	mov	rdi,rsp
+	lea	rsi,[kt_user]
+	mov	edx,16
+	call	ct_equal
+	and	al,bl
+	movzx	eax,al
+	expect	'access token round trip'
+
+	add	qword [g_unix_now],ACCESS_TTL
+	call	.verify
+	setc	al
+	movzx	eax,al
+	expect	'access token expired'
+	sub	qword [g_unix_now],ACCESS_TTL
+
+	xor	byte [rsp+32+5],1
+	call	.verify
+	setc	al
+	movzx	eax,al
+	expect	'access token payload tampered'
+	xor	byte [rsp+32+5],1
+
+	xor	byte [rsp+32+40],1
+	call	.verify
+	setc	al
+	movzx	eax,al
+	expect	'access token signature tampered'
+	xor	byte [rsp+32+40],1
+
+	xor	byte [g_token_key+31],1
+	call	.verify
+	setc	al
+	movzx	eax,al
+	expect	'access token under another key'
+	xor	byte [g_token_key+31],1
+
+	dec	dword [rsp+16]
+	call	.verify
+	setc	al
+	movzx	eax,al
+	expect	'access token truncated'
+	inc	dword [rsp+16]
+
+	call	.verify
+	setnc	al
+	movzx	eax,al
+	expect	'access token still valid after restoring'
+	add	rsp,128
+	pop	rbx
+	ret
+
+; Verify the token in the caller's frame (rsp+8 here).
+.verify:
+	lea	rsi,[rsp+8+32]
+	mov	edx,[rsp+8+16]
+	lea	rdi,[rsp+8]
+	jmp	access_token_verify
 
 ; Report a boolean result: eax = 1 passes.
 macro expect name*

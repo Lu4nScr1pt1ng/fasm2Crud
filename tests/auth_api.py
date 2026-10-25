@@ -1,14 +1,24 @@
 #!/usr/bin/env python3
 """Account endpoints against a running server with a database.
 
-usage: auth_api.py port
+usage: auth_api.py port [token-key]
+
+With the server's API_TOKEN_KEY, access tokens are also checked here with
+hashlib: payload layout, user id, lifetime and HMAC-SHA-256 signature.
 """
+import base64
+import hashlib
+import hmac
 import json
+import struct
+import time
+import uuid
 import secrets
 import socket
 import sys
 
 PORT = int(sys.argv[1])
+KEY = sys.argv[2] if len(sys.argv) > 2 else None
 
 
 def call(path, body, ctype="application/json", method="POST", close=False):
@@ -80,6 +90,22 @@ check("token type", "Bearer", tokens.get("token_type"))
 check("access token lifetime", 900, tokens.get("expires_in"))
 check("refresh token is 256 bits", 43, len(tokens.get("refresh_token", "")))
 first = tokens.get("refresh_token", "")
+
+def b64url(text):
+    return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+if KEY:
+    payload_b64, _, sig_b64 = tokens.get("access_token", "").partition(".")
+    payload = b64url(payload_b64)
+    key = b64url(KEY)
+    check("access token signature (hashlib)", True,
+          hmac.compare_digest(hmac.new(key, payload, hashlib.sha256).digest(), b64url(sig_b64)))
+    version, user, epoch, expiry = struct.unpack("<B16sII", payload)
+    check("access token version", 1, version)
+    check("access token user is the registered id", body.get("id"), str(uuid.UUID(bytes=user)))
+    check("access token epoch", 0, epoch)
+    check("access token expires in 15 minutes", True, abs(expiry - time.time() - 900) < 5)
 
 st, _, rotated = call("/v1/auth/refresh", {"refresh_token": first})
 check("refresh", 200, st)

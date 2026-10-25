@@ -62,6 +62,66 @@ access_token_make:
 	pop	rbx
 	ret
 
+; rsi = token text, edx = length, rdi = user id (16 bytes, written only
+; when valid). eax = session epoch; CF when the token is malformed, forged
+; or expired. The signature is compared in constant time.
+access_token_verify:
+	push	rbx
+	push	r12
+	sub	rsp,104
+	; [rsp] payload (25, decoded into 32), [rsp+32] signature (32),
+	; [rsp+64] expected signature (32)
+	mov	r12,rdi
+	mov	rbx,rsi
+	cmp	edx,ACCESS_TOKEN_LEN
+	jne	.bad
+	cmp	byte [rbx+34],'.'
+	jne	.bad
+	mov	rdi,rsp
+	mov	rsi,rbx
+	mov	edx,34
+	call	base64url_decode
+	cmp	rax,ACCESS_PAYLOAD
+	jne	.bad
+	lea	rdi,[rsp+32]
+	lea	rsi,[rbx+35]
+	mov	edx,43
+	call	base64url_decode
+	cmp	rax,32
+	jne	.bad
+	lea	rdi,[rsp+64]
+	lea	rsi,[g_token_key]
+	mov	edx,32
+	mov	rcx,rsp
+	mov	r8d,ACCESS_PAYLOAD
+	call	hmac_sha256
+	lea	rdi,[rsp+32]
+	lea	rsi,[rsp+64]
+	mov	edx,32
+	call	ct_equal
+	test	eax,eax
+	jz	.bad
+	; Only signed bytes are trusted from here on.
+	cmp	byte [rsp],TOKEN_VERSION
+	jne	.bad
+	mov	eax,[rsp+21]			; expiry
+	cmp	rax,[g_unix_now]
+	jbe	.bad
+	movdqu	xmm0,[rsp+1]
+	movdqu	[r12],xmm0
+	mov	eax,[rsp+17]
+	add	rsp,104
+	pop	r12
+	pop	rbx
+	clc
+	ret
+.bad:
+	add	rsp,104
+	pop	r12
+	pop	rbx
+	stc
+	ret
+
 ; "\x" + 64 hex digits of SHA-256(bytes): bytea literal for a parameter.
 ; rdi = destination (66), rsi = bytes, edx = length.
 sha256_bytea:

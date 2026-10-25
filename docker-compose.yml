@@ -18,6 +18,9 @@ services:
       API_DB_NAME: "${POSTGRES_DB:-fasm2crud}"
       API_DB_PASSWORD: "${API_DB_PASSWORD:-change-me-too}"
       API_DB_CONNS: "2"
+      # 32 random bytes, base64url: signs access tokens. Empty: a random key
+      # per start, so every restart logs everyone out.
+      API_TOKEN_KEY: "${API_TOKEN_KEY:-}"
     networks:
       backend:
         ipv4_address: 10.231.0.20

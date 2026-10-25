@@ -62,8 +62,9 @@ start:
 ;   API_DB_NAME    (default fasm2crud)
 ;   API_DB_PASSWORD  required with API_DB_HOST
 ;   API_DB_CONNS   connections per worker (default 2)
-;   API_TOKEN_KEY  base64url of the 32-byte access token key; when unset a
-;                  random key is made at startup (tokens die with the process)
+;   API_TOKEN_KEY  base64url of the 32-byte access token key; when unset or
+;                  empty a random key is made at startup (tokens die with
+;                  the process)
 config_load:
 	; CPUs available to us, honouring cgroup cpusets and taskset.
 	xor	edi,edi
@@ -133,6 +134,8 @@ config_token_key:
 	call	getenv
 	test	rax,rax
 	jz	.random
+	cmp	byte [rax],0			; set but empty (compose default): unset
+	je	.random
 	mov	rsi,rax
 	xor	edx,edx
 @@:

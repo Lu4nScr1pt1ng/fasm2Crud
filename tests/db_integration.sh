@@ -17,7 +17,9 @@ wait_ready() {
 	return 1
 }
 
-API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+# A known signing key, so tests/auth_api.py can check tokens independently.
+KEY="$(head -c32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')"
+API_TOKEN_KEY="$KEY" API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
 good=$!
 API_PORT=18091 API_WORKERS=1 API_DB_HOST="$HOST" API_DB_PASSWORD=wrong ./build/fasm2crud 2>/dev/null &
 bad=$!
@@ -26,7 +28,7 @@ trap 'kill $good $bad 2>/dev/null || true' EXIT
 wait_ready 18090 || true
 check "readyz through SCRAM and the query pipeline" 200 "$(code 18090)"
 check "wrong password answers 503" 503 "$(code 18091)"
-python3 -I tests/auth_api.py 18090 || status=1
+python3 -I tests/auth_api.py 18090 "$KEY" || status=1
 
 docker compose restart postgres >/dev/null 2>&1
 if wait_ready 18090; then r=200; else r="$(code 18090)"; fi

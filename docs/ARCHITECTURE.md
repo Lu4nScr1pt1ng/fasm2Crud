@@ -214,8 +214,11 @@ replies are read through the worker's ring. The hasher:
 * runs at nice 10 on any CPU of the service, so a worker with requests to
   serve wins its CPU back;
 * keeps only its socket, cannot be dumped or traced (`PR_SET_DUMPABLE` 0),
-  and enters seccomp strict mode before its first job: from then on it can
-  read, write and exit, nothing else. Memory is reserved before that;
+  and installs a seccomp filter before its first job: from then on it can
+  read, write and exit, and any other system call kills it. Memory is
+  reserved before that. Strict mode would allow the same set, but it cannot
+  be entered under an existing filter such as Docker's, while filters
+  stack. A hasher that cannot install the filter exits instead of serving;
 * dies with its worker. If it dies first, its jobs are answered with 503
   at once and a new hasher starts on the next tick.
 
