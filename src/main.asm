@@ -41,6 +41,7 @@ include 'auth/password.inc'
 include 'auth/token.inc'
 include 'app/router.inc'
 include 'app/auth.inc'
+include 'app/notes.inc'
 include 'tools/healthcheck.inc'
 
 segment readable

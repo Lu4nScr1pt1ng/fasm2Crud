@@ -11,11 +11,18 @@ CONT_LOGIN_USER	= 2
 CONT_LOGIN_TOKEN = 3
 CONT_REFRESH	= 4
 CONT_LOGOUT	= 5
+CONT_NOTE_CREATED = 6
+CONT_NOTE_GET	= 7
+CONT_NOTE_UPDATED = 8
+CONT_NOTE_DELETED = 9
+CONT_NOTES_PAGE	= 10
 
 rodata
 	align 8
 	pg_cont_tbl	dq cont_ready, cont_register, cont_login_user, cont_login_token
 			dq cont_refresh, cont_logout
+			dq cont_note_created, cont_note_get, cont_note_updated, cont_note_deleted
+			dq cont_notes_page
 end rodata
 
 ; r12 = connection; g_req holds the parsed request.
@@ -29,7 +36,7 @@ route:
 	cmp	eax,7
 	je	.len7
 	cmp	eax,9
-	ja	.long
+	jae	.long
 .not_found:
 	mov	edi,ST_404
 	jmp	respond_status
@@ -37,10 +44,17 @@ route:
 .long:
 	mov	rcx,'/v1/auth'
 	cmp	[rsi],rcx
-	jne	.not_found
+	jne	.notes
 	cmp	byte [rsi+8],'/'
 	jne	.not_found
 	jmp	auth_route
+.notes:
+	mov	rcx,'/v1/note'
+	cmp	[rsi],rcx
+	jne	.not_found
+	cmp	byte [rsi+8],'s'
+	jne	.not_found
+	jmp	notes_route
 
 .len8:
 	mov	rax,'/healthz'
@@ -82,6 +96,22 @@ route:
 .not_implemented:
 	mov	edi,ST_501
 	jmp	respond_status
+
+; eax = output bytes the current request's response may need (more than
+; RESP_RESERVE only for routes with large responses).
+route_output_need:
+	xor	eax,eax
+	cmp	dword [req_path_len],9
+	jb	.done
+	mov	rdx,[req_path]
+	mov	rcx,'/v1/note'
+	cmp	[rdx],rcx
+	jne	.done
+	cmp	byte [rdx+8],'s'
+	jne	.done
+	mov	eax,NOTE_RESP_MAX
+.done:
+	ret
 
 respond_db_unavailable:
 	mov	edi,ST_503

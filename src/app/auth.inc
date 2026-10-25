@@ -22,7 +22,7 @@
 HCONT_REGISTER	= 0
 HCONT_LOGIN	= 1
 
-AUTH_SCRATCH	= 512
+AUTH_SCRATCH	= 4096		; decoded JSON members (notes use it too)
 
 cstring name_email, 'email'
 cstring name_password, 'password'
@@ -185,9 +185,32 @@ request_bearer:
 	stc
 	ret
 
-; Parse the body into g_auth_vals. rdi = field spec, esi = field count;
-; every field is required. eax = 0, or the ST_xxx to answer.
+; Parse the body into g_auth_vals. rdi = field spec, esi = field count
+; (at most 2); every field is required. eax = 0, or the ST_xxx to answer.
 auth_parse:
+	push	rsi
+	call	json_body_parse
+	pop	rsi
+	test	eax,eax
+	jnz	.done
+	xor	ecx,ecx
+.present:
+	mov	edx,ecx
+	shl	edx,4
+	cmp	dword [g_auth_vals+rdx+JV_PRESENT],0
+	je	.schema
+	inc	ecx
+	cmp	ecx,esi
+	jb	.present
+	xor	eax,eax
+.done:
+	ret
+.schema:
+	mov	eax,ST_422
+	ret
+
+; Same, but members may be absent (check JV_PRESENT).
+json_body_parse:
 	lea	rax,[g_auth_job]
 	mov	[rax+JJ_SPEC],rdi
 	mov	[rax+JJ_FIELDS],esi
@@ -200,23 +223,12 @@ auth_parse:
 	mov	[rax+JJ_BODY],rcx
 	mov	ecx,[req_body_len]
 	mov	[rax+JJ_BODY_LEN],ecx
-	push	rsi
 	mov	rdi,rax
 	call	json_parse_object
-	pop	rsi
 	cmp	eax,JSON_SYNTAX
 	je	.syntax
 	cmp	eax,JSON_OK
 	jne	.schema
-	xor	ecx,ecx
-.present:
-	mov	edx,ecx
-	shl	edx,4
-	cmp	dword [g_auth_vals+rdx+JV_PRESENT],0
-	je	.schema
-	inc	ecx
-	cmp	ecx,esi
-	jb	.present
 	xor	eax,eax
 	ret
 .syntax:

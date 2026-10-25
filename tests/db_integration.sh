@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Integration checks against the compose PostgreSQL (make up first):
 # SCRAM login and a pipelined round trip, a wrong password failing fast,
-# the account endpoints, and recovery after the database restarts.
+# the account and notes endpoints, and recovery after the database restarts.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -29,6 +29,7 @@ wait_ready 18090 || true
 check "readyz through SCRAM and the query pipeline" 200 "$(code 18090)"
 check "wrong password answers 503" 503 "$(code 18091)"
 python3 -I tests/auth_api.py 18090 "$KEY" || status=1
+python3 -I tests/notes_api.py 18090 || status=1
 
 docker compose restart postgres >/dev/null 2>&1
 if wait_ready 18090; then r=200; else r="$(code 18090)"; fi

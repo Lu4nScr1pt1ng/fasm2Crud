@@ -23,6 +23,7 @@ C_ACTIVE_POS	= 28		; index in g_active_list
 C_SCAN		= 32		; where the header terminator search resumes
 C_FIDX		= 36		; direct descriptor index
 C_LINGER	= 40		; bytes discarded during lingering close
+C_AUX		= 44		; a value the current request keeps for its continuation
 C_GEN		= 64		; bumped per accept; outside the zeroed header
 
 CS_FREE		= 0
@@ -414,6 +415,7 @@ process_input:
 	call	http_handle
 	test	eax,eax
 	jz	.incomplete
+	js	.wait_out			; needs more output room: after the send
 	add	r13d,eax
 	jmp	.next
 .incomplete:

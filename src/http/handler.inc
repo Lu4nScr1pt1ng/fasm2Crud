@@ -8,7 +8,8 @@ cstring hdr_close, 'Connection: close',13,10
 cstring hdr_no_store, 'Cache-Control: no-store',13,10
 
 ; r12 = connection, rdi = request start, esi = bytes available.
-; eax = bytes consumed by one request, or 0 when more data is needed.
+; eax = bytes consumed by one request, 0 when more data is needed, or -1
+; when its response may not fit yet (retry once the output is sent).
 http_handle:
 	push	r13
 	push	r14
@@ -34,6 +35,15 @@ http_handle:
 	ja	.too_large
 	cmp	ecx,r14d
 	ja	.need_body
+	; Some responses are larger than RESP_RESERVE (a note): wait until the
+	; output buffer has room for the largest one instead of overflowing.
+	push	rcx
+	call	route_output_need
+	pop	rcx
+	mov	edx,OUT_CAP
+	sub	edx,[r12+C_OUT_LEN]
+	cmp	edx,eax
+	jb	.defer
 	mov	dword [r12+C_SCAN],0
 	lea	rax,[r13+r15]
 	mov	[req_body],rax
@@ -69,6 +79,10 @@ http_handle:
 	cmova	eax,ecx
 	mov	[r12+C_SCAN],eax
 	xor	eax,eax
+	jmp	.done
+.defer:
+	mov	dword [r12+C_SCAN],0
+	mov	eax,-1
 	jmp	.done
 .need_body:
 	lea	eax,[r15-4]

@@ -227,7 +227,47 @@ At most 16 jobs wait per worker; beyond that, auth requests get 503 with
 accepted, 84 refused with 503, and `GET /healthz` on the same worker kept a
 0.08 ms median (0.25 ms max) while the hashes ran.
 
-## Crypto
+## Notes (`src/app/notes.inc`)
+
+| Endpoint | Body | Answer |
+|---|---|---|
+| `GET /v1/notes?limit=&cursor=` | | 200 `{"items":[summary],"next_cursor"}` |
+| `POST /v1/notes` | `title`, `body`? | 201 note, `Location`, `ETag` |
+| `GET /v1/notes/{id}` | | 200 note, `ETag` |
+| `PATCH /v1/notes/{id}` | `title`?, `body`? | 200 note, `ETag`; needs `If-Match` |
+| `DELETE /v1/notes/{id}` | | 204; needs `If-Match` |
+
+Every request needs `Authorization: Bearer <access token>` (401 with
+`WWW-Authenticate: Bearer` otherwise), checked in the worker with no
+database access. Notes of other users are 404, never 403.
+
+* **Optimistic concurrency.** The ETag is the version. PATCH and DELETE
+  need `If-Match: "<version>"`: 428 without it, 412 with the current ETag
+  when it is stale. The version check and the write are one statement,
+  and the row lock makes a concurrent writer re-check the version after
+  the first commits: of 8 concurrent PATCHes of one version, exactly one
+  succeeds.
+* **Keyset pagination**, newest first, over the `(user_id, id DESC)` index:
+  `cursor` is the last id seen, so a page costs the same however deep it
+  is and concurrent inserts never shift it. `limit` is 1..50 (default 20);
+  the query asks for one row more to know whether another page follows.
+* **Sizes follow from the memory model.** A response is written in place
+  into the connection's 8 KiB output buffer, so a note must always fit:
+  title 1..200 bytes and body up to 3000 bytes of UTF-8, with no control
+  characters but tab, LF and CR (each escapes to at most two bytes). A
+  notes request waits, unparsed, until the output buffer has room for the
+  largest note (`route_output_need`), so pipelined requests are delayed,
+  never cut. A page of summaries stops early when the buffer is full and
+  sets `next_cursor` there; following the cursors still returns every note
+  exactly once.
+* Times come from the database as RFC 3339 in UTC with microseconds.
+
+Measured (the reference split: API on 4 cores, PostgreSQL on 2, wrk with
+32 connections): `GET /v1/notes/{id}` 73k req/s (p50 0.34 ms), a page of
+20 summaries 48k req/s (p50 0.52 ms), against 385k req/s for `/healthz`
+on the same run. Token checks and JSON cost little next to the query.
+
+
 
 All primitives live in `src/crypto/` and are checked by `build/kat`
 (published test vectors) and `tests/kat/differential.py` (random inputs
@@ -315,7 +355,7 @@ throughput, see `supervisor.inc`).
 | 3 | crypto with known-answer tests: SHA-256 (SHA-NI), HMAC, PBKDF2, BLAKE2b, Argon2id, getrandom | done |
 | 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | done |
 | 5 | auth: register, login, refresh, logout, isolated hasher process | done |
-| 6 | notes CRUD, JSON, keyset pagination, If-Match | next |
-| 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | |
+| 6 | notes CRUD, JSON, keyset pagination, If-Match | done |
+| 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | next |
 | 8 | stress tests, `perf`, tuning | |
 | 9 (optional) | TLS 1.3 with ML-KEM in assembly | |

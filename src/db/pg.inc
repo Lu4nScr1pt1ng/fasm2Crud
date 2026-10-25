@@ -153,6 +153,46 @@ pg_statement STMT_REVOKE_FAMILY, \
 	'UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = ', \
 	'(SELECT family_id FROM refresh_tokens WHERE token_hash = $1::bytea) AND revoked_at IS NULL'
 
+; Notes (src/app/notes.inc). Times are RFC 3339 text, made by the database.
+pg_statement STMT_NOTE_INSERT, \
+	'INSERT INTO notes (user_id, title, body) VALUES ($1::uuid, $2, COALESCE($3, '''')) ', \
+	'RETURNING id, title, body, version, ', \
+	'to_char(created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
+	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'')'
+pg_statement STMT_NOTE_GET, \
+	'SELECT id, title, body, version, ', \
+	'to_char(created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
+	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
+	'FROM notes WHERE id = $1::uuid AND user_id = $2::uuid'
+; One row while the note exists: the updated note (all NULL when the
+; version did not match) and the current version. The row lock makes a
+; concurrent writer re-check the version after the first one commits.
+pg_statement STMT_NOTE_UPDATE, \
+	'WITH cur AS (SELECT version FROM notes WHERE id = $1::uuid AND user_id = $2::uuid), ', \
+	'upd AS (UPDATE notes n SET title = COALESCE($4, n.title), body = COALESCE($5, n.body), ', \
+	'version = n.version + 1, updated_at = now() FROM cur ', \
+	'WHERE n.id = $1::uuid AND n.user_id = $2::uuid AND n.version = $3::int ', \
+	'RETURNING n.id, n.title, n.body, n.version, n.created_at, n.updated_at) ', \
+	'SELECT upd.id, upd.title, upd.body, upd.version, ', \
+	'to_char(upd.created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
+	'to_char(upd.updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
+	'cur.version FROM cur LEFT JOIN upd ON true'
+; One row while the note exists: its version and how many rows went.
+pg_statement STMT_NOTE_DELETE, \
+	'WITH cur AS (SELECT version FROM notes WHERE id = $1::uuid AND user_id = $2::uuid), ', \
+	'del AS (DELETE FROM notes n USING cur WHERE n.id = $1::uuid AND n.user_id = $2::uuid ', \
+	'AND n.version = $3::int RETURNING n.id) ', \
+	'SELECT cur.version, (SELECT count(*) FROM del) FROM cur'
+; Keyset pages over notes_user_id_id; $2 is limit + 1, to see if more follow.
+pg_statement STMT_NOTES_PAGE, \
+	'SELECT id, title, version, ', \
+	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
+	'FROM notes WHERE user_id = $1::uuid ORDER BY id DESC LIMIT $2::int'
+pg_statement STMT_NOTES_PAGE_AFTER, \
+	'SELECT id, title, version, ', \
+	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
+	'FROM notes WHERE user_id = $1::uuid AND id < $3::uuid ORDER BY id DESC LIMIT $2::int'
+
 rodata
 	align 8
 	pg_stmt_tbl:
@@ -1254,24 +1294,39 @@ pg_tick:
 .done:
 	ret
 
-; Column of the first DataRow in a reply range.
-; rsi = first message, rdx = end, ecx = column.
-; rax = value, edx = length. CF when there is no row or the value is NULL.
-pg_row_field:
-	push	rbx
-	mov	rbx,rdx
-.message:
+; Reply rows. A reply range holds BindComplete, DataRows, CommandComplete
+; and ReadyForQuery (no RowDescription: statements are prepared).
+
+; First DataRow at or after rsi, before rdx. rsi = that message; CF when
+; there is none. Only rax is clobbered.
+pg_find_row:
 	lea	rax,[rsi+5]
-	cmp	rax,rbx
+	cmp	rax,rdx
 	ja	.none
+	cmp	byte [rsi],'D'
+	je	.found
 	mov	eax,[rsi+1]
 	bswap	eax
-	lea	r8,[rsi+rax+1]			; next message
-	cmp	byte [rsi],'D'
-	je	.row
-	mov	rsi,r8
-	jmp	.message
-.row:
+	lea	rsi,[rsi+rax+1]
+	jmp	pg_find_row
+.found:
+	clc
+	ret
+.none:
+	stc
+	ret
+
+; rsi = message: advance rsi past it.
+pg_skip_message:
+	mov	eax,[rsi+1]
+	bswap	eax
+	lea	rsi,[rsi+rax+1]
+	ret
+
+; Column ecx of the DataRow at rsi (preserved). rax = value, edx = length;
+; CF when the value is NULL or there is no such column.
+pg_field:
+	push	rsi
 	movzx	edx,word [rsi+5]
 	xchg	dl,dh
 	cmp	ecx,edx
@@ -1294,12 +1349,21 @@ pg_row_field:
 	js	.none
 	mov	edx,eax
 	mov	rax,rsi
-	pop	rbx
+	pop	rsi
 	clc
 	ret
 .none:
-	pop	rbx
+	pop	rsi
 	stc
+	ret
+
+; Column ecx of the first DataRow in rsi..rdx: rax = value, edx = length;
+; CF when there is no row or the value is NULL.
+pg_row_field:
+	call	pg_find_row
+	jc	.done
+	jmp	pg_field
+.done:
 	ret
 
 ; eax = 1 when at least one connection is ready.
