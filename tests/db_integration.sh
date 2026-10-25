@@ -53,6 +53,9 @@ sleep 0.5
 python3 -I tests/metrics_api.py 18094 || status=1
 kill $met 2>/dev/null || true
 
+# A short network fuzzing round (make fuzz runs longer ones).
+NET_FUZZ_CONNS=3000 ./tests/fuzz/net_fuzz.sh || status=1
+
 docker compose restart postgres >/dev/null 2>&1
 if wait_ready 18090; then r=200; else r="$(code 18090)"; fi
 check "recovers after a database restart" 200 "$r"

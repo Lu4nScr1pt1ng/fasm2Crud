@@ -8,6 +8,7 @@ import secrets
 import socket
 import sys
 import threading
+import time
 
 PORT = int(sys.argv[1])
 failed = 0
@@ -197,5 +198,34 @@ check("the largest page is whole", (200, 50, list(reversed(wide))[:50], wide[0])
       (st, len(page["items"]), [n["id"] for n in page["items"]], page.get("next_cursor") and
        call("GET", f"/v1/notes?limit=50&cursor={page['next_cursor']}", token=carol)[2]["items"][0]["id"]))
 check("its titles round trip", True, all(n["title"] == title for n in page["items"]))
+
+# Clients that leave before the database answers: their replies are
+# dropped, and nothing that belongs to other requests is touched (a
+# /readyz reply once carried a garbage auth context and crashed a worker).
+import os
+def workers():
+    out = set()
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() != "fasm2crud-w":
+                    continue
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                if f"API_PORT={PORT}".encode() in f.read().split(b"\0"):
+                    out.add(int(pid))
+        except OSError:
+            pass
+    return out
+import struct
+before = workers()
+for path in ["/readyz", "/v1/notes", f"/v1/notes/{ids[0]}"] * 70:
+    # A response first, so the server writes, fails on the reset and closes
+    # the connection while the query is still out.
+    s = socket.create_connection(("127.0.0.1", PORT))
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.sendall(request("GET", "/healthz") + request("GET", path, token=dave))
+    s.close()
+time.sleep(1)
+check("clients leaving mid-query crash nothing", (True, before), (call("GET", "/healthz")[0] == 200, workers()))
 
 sys.exit(1 if failed else 0)

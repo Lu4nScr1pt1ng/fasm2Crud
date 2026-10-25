@@ -76,6 +76,7 @@ route:
 	mov	esi,CONT_READY
 	xor	edx,edx
 	xor	ecx,ecx
+	xor	r8d,r8d				; no auth context
 	call	db_query
 	test	eax,eax
 	jnz	respond_db_unavailable

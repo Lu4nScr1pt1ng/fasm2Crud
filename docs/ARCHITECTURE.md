@@ -309,6 +309,78 @@ implementation), both part of `make test`.
 Secrets are compared in constant time, and buffers that held them (hash
 contexts, the Argon2 memory and its stack frame) are wiped before return.
 
+## Confinement
+
+The process confines itself; Docker's own profile (below) only adds to it.
+
+* **Seccomp, in layers** (`src/core/seccomp.inc`). Filters are inherited
+  and can only get stricter, so the supervisor installs, before its first
+  fork, what it needs plus what a worker and a hasher need to start; each
+  worker adds a tighter filter once it is set up; the hasher has its own.
+  Refused everywhere: `execve`, `open` and `openat` (the server never
+  opens a file), `ptrace`, `clone`, `clone3` and `vfork` (fork only),
+  executable mappings (`mmap` and `mprotect` are checked for `PROT_EXEC`),
+  sockets other than `AF_INET` and `AF_UNIX`, and `prctl` options not in
+  use. A refused call raises `SIGSYS`; the handler logs which call it was
+  and exits, and the supervisor restarts the worker. A foreign
+  architecture (x32, i386) is killed outright. `build/kat` checks the
+  filters in confined children.
+* **io_uring allowlist.** io_uring operations bypass seccomp, so each ring
+  is created disabled, registers the 12 opcodes and 3 SQE flags it uses
+  (`IORING_REGISTER_RESTRICTIONS`) and only then is enabled; no register
+  operation is allowed afterwards.
+* The hasher: see above (filter of its own, not dumpable, nice 10).
+
+## Rate limiting (`src/app/ratelimit.inc`)
+
+Register, login and refresh (each a password hash or a database write)
+are limited per client IPv4 address: a token bucket of `API_AUTH_BURST`
+(default 10) refilled at `API_AUTH_RATE` a minute (default 30), 429 with
+`Retry-After` beyond it. Buckets live in a fixed table per worker (8192
+entries, 8-way probing; a full bucket carries no information and is
+reused first, otherwise the fullest one is evicted, so the addresses being
+limited are the ones that stay). Workers share nothing, so a client
+spreading its connections over every worker gets up to workers times the
+rate.
+
+Accepted sockets are io_uring direct descriptors, outside the fd table,
+so `getpeername` cannot see them: the ring asks for the address instead
+(`IORING_OP_URING_CMD`, getsockopt `SO_PEERNAME`), once per connection and
+only when a limited endpoint is first requested.
+
+## Metrics (`src/app/metrics.inc`)
+
+`GET /metrics`, Prometheus text format: responses by status code, request
+latency histogram (TSC-timed from the parsed request to its response),
+connections, database queries, errors and ready connections, hasher jobs,
+rejections, restarts and queue, large buffers in use and exhausted, memory
+returned to the kernel, rate-limited requests, worker restarts.
+
+Each worker counts into its own cache-line aligned block of a `MAP_SHARED`
+region the supervisor maps before forking: one plain increment on a line
+no other process writes, so the request path stays shared-nothing. Any
+worker answering `/metrics` adds up every block. Blocks outlive their
+worker, so counters stay monotonic across restarts; gauges are republished
+every tick. `API_METRICS=off` answers 404.
+
+## Testing
+
+* `make test`: known-answer tests (crypto, tokens, seccomp), differential
+  tests against hashlib, libargon2 and Python's json, 40 000 fuzz cases,
+  HTTP conformance and graceful shutdown.
+* `make itest` (with `make up`): every endpoint against PostgreSQL, memory
+  growth and return, pool limits, rate limits, metrics across a killed
+  worker, a short network fuzzing round, recovery after a database restart.
+* `make fuzz` (`FUZZ_CASES`, `NET_FUZZ_CONNS`): `build/fuzz` runs the
+  request and JSON parsers on inputs that end at a `PROT_NONE` page (the
+  HTTP data followed by exactly the 32 bytes SIMD scans may read, filled
+  with CRLFCRLF), and every result is compared with reference
+  implementations; then thousands of concurrent connections send mutated
+  requests in random pieces, pipelined, abandoned, never read, and the
+  server must not lose a worker, a connection slot or a large buffer. It
+  found a crash that unit tests had not: a `/readyz` reply for a client
+  that had gone carried a garbage auth context.
+
 ## Docker
 
 * The build stage fetches fasm2 at a pinned commit and verifies the
@@ -381,6 +453,6 @@ throughput, see `supervisor.inc`).
 | 4 | PostgreSQL client: startup, SCRAM, prepared statements, pipelining, reconnect with backoff, circuit breaker | done |
 | 5 | auth: register, login, refresh, logout, isolated hasher process | done |
 | 6 | notes CRUD, JSON, keyset pagination, If-Match | done |
-| 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | next |
-| 8 | stress tests, `perf`, tuning | |
+| 7 | seccomp filter inside the binary, rate limiting, fuzzing, `/metrics` | done |
+| 8 | stress tests, `perf`, tuning | next |
 | 9 (optional) | TLS 1.3 with ML-KEM in assembly | |

@@ -65,10 +65,13 @@ auth_ctx_ptr:
 	lea	rax,[g_auth_ctx+rax]
 	ret
 
-; edi = context id + 1, or 0 (nothing to do).
+; edi = context id + 1, or 0 (nothing to do). Anything out of range is
+; ignored rather than trusted: wiping 1 KiB at a wrong address would be
+; far worse than a context leaked by a bug.
 auth_ctx_free:
-	test	edi,edi
-	jz	.done
+	lea	eax,[rdi-1]
+	cmp	eax,AUTH_CTX_MAX
+	jae	.done
 	push	rdi
 	call	auth_ctx_ptr
 	mov	rdi,rax
