@@ -951,6 +951,14 @@ pg_deliver:
 	mov	r14,rsi
 	mov	r15,rdx
 	mov	r8d,eax
+	cmp	eax,PGR_SQL_ERROR
+	jne	@f
+	metric_inc M_DB_ERRORS
+@@:
+	cmp	eax,PGR_UNAVAILABLE
+	jne	@f
+	metric_inc M_DB_UNAVAILABLE
+@@:
 	mov	eax,[r13+PG_QHEAD]
 	mov	ecx,eax
 	and	ecx,PG_MAX_INFLIGHT - 1
@@ -1126,9 +1134,11 @@ db_query:
 	mov	ebx,r11d
 	call	pg_commit_tx
 	pop	rbx
+	metric_inc M_DB_QUERIES
 	xor	eax,eax
 	jmp	.done
 .unavailable:
+	metric_inc M_DB_UNAVAILABLE
 	mov	eax,-1
 .done:
 	pop	r8
@@ -1328,6 +1338,7 @@ pg_trim:
 	mov	edx,MADV_DONTNEED
 	mov	eax,SYS_madvise
 	syscall
+	metric_add M_RETURNED, rsi
 	and	dword [r13+PG_GREW],not 1
 .rx:
 	test	dword [r13+PG_GREW],2
@@ -1343,6 +1354,7 @@ pg_trim:
 	mov	edx,MADV_DONTNEED
 	mov	eax,SYS_madvise
 	syscall
+	metric_add M_RETURNED, rsi
 	and	dword [r13+PG_GREW],not 2
 .done:
 	ret
@@ -1416,6 +1428,25 @@ pg_row_field:
 	call	pg_find_row
 	jc	.done
 	jmp	pg_field
+.done:
+	ret
+
+; rax = connections ready.
+db_ready_count:
+	xor	eax,eax
+	cmp	dword [g_db_enabled],0
+	je	.done
+	xor	ecx,ecx
+.each:
+	cmp	ecx,[g_pg_count]
+	jae	.done
+	imul	edx,ecx,PG_SIZE
+	cmp	dword [g_pg+rdx+PG_STATE],PGS_READY
+	jne	@f
+	inc	eax
+@@:
+	inc	ecx
+	jmp	.each
 .done:
 	ret
 

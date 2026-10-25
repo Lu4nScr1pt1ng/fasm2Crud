@@ -11,6 +11,7 @@ include 'core/sections.inc'
 include 'sys/linux.inc'
 include 'sys/uring.inc'
 include 'core/config.inc'
+include 'core/stats.inc'
 include 'http/status.inc'
 
 segment readable executable
@@ -42,8 +43,10 @@ include 'auth/ctx.inc'
 include 'auth/password.inc'
 include 'auth/token.inc'
 include 'app/router.inc'
+include 'app/ratelimit.inc'
 include 'app/auth.inc'
 include 'app/notes.inc'
+include 'app/metrics.inc'
 include 'tools/healthcheck.inc'
 
 segment readable

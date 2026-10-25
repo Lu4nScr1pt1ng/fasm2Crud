@@ -384,6 +384,10 @@ copy_field:
 ; ---------------------------------------------------------------- register
 
 auth_register:
+	call	rate_take
+	jnc	@f
+	ret
+@@:
 	push	r13
 	push	r15
 	lea	rdi,[spec_credentials]
@@ -549,6 +553,10 @@ cont_register:
 ; ---------------------------------------------------------------- login
 
 auth_login:
+	call	rate_take
+	jnc	@f
+	ret
+@@:
 	push	r13
 	sub	rsp,16
 	lea	rdi,[spec_credentials]
@@ -764,6 +772,10 @@ cont_login_token:
 ; ---------------------------------------------------------------- refresh
 
 auth_refresh:
+	call	rate_take
+	jnc	@f
+	ret
+@@:
 	push	r13
 	push	r15
 	sub	rsp,40

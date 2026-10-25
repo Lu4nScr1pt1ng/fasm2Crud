@@ -85,6 +85,7 @@ supervisor_main:
 	log_lit ' connections each'
 	call	log_end
 
+	call	metrics_init
 	; From here on the supervisor and everything it forks are confined.
 	call	seccomp_supervisor
 
@@ -302,6 +303,7 @@ reap_workers:
 	log_lit ', restarting'
 	call	log_end
 
+	call	metrics_restart
 	; A worker that dies right after starting is crash-looping; slow the
 	; restarts down so the supervisor does not spin.
 	call	monotonic_seconds

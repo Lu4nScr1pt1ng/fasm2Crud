@@ -66,6 +66,8 @@ start:
 ;   API_DB_CONNS   connections per worker (default 2)
 ;   API_LARGE_BUFFERS  128 KiB buffers per worker for large requests and
 ;                  responses (default 64); address space only until used
+;   API_AUTH_RATE  register/login/refresh per client address and minute,
+;                  per worker (default 30); API_AUTH_BURST at once (10)
 ;   API_TRIM_IDLE  seconds before idle memory goes back to the kernel
 ;                  (default 30)
 ;   API_TOKEN_KEY  base64url of the 32-byte access token key; when unset or
@@ -144,6 +146,7 @@ config_load:
 	mov	r8d,86400
 	call	env_uint
 	mov	[g_trim_idle],eax
+	call	rate_config
 	call	config_token_key
 	jmp	config_db
 

@@ -88,6 +88,7 @@ SQE_LEN		= 24
 SQE_OP_FLAGS	= 28		; msg_flags, timeout_flags, cancel_flags, ...
 SQE_USER_DATA	= 32
 SQE_FILE_INDEX	= 44
+SQE_ADDR3	= 48
 SQE_SIZE	= 64
 
 ; struct io_uring_cqe (16 bytes)

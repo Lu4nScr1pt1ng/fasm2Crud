@@ -44,6 +44,9 @@ C_IN_LARGE	= 96		; large buffer index + 1, or 0
 C_OUT_LARGE	= 100
 C_IN_SINCE	= 104		; tick the large buffers were taken
 C_OUT_SINCE	= 108
+C_T0		= 112		; dq: TSC when the current request was parsed (0: none)
+C_PEER_STATE	= 120		; PEER_xxx (src/app/ratelimit.inc)
+C_PEER_ADDR	= 128		; sockaddr_in of the client, once known
 
 CONN_KEEP	= 0		; the whole slot can go back
 CONN_WARM	= 64		; free slots always kept resident
@@ -65,6 +68,7 @@ F_WAIT_OUT	= 1 shl 2
 F_CLOSE_AFTER	= 1 shl 3
 F_LINGER	= 1 shl 4
 F_WAIT_DB	= 1 shl 5	; a database or hasher reply will answer the current request
+F_WAIT_PEER	= 1 shl 6	; the current request needs the client address first
 
 macro conn_ptr reg*, slot*
 	mov	reg,slot
@@ -281,6 +285,9 @@ on_accept:
 	mov	dword [r12+C_IN_CAP],IN_CAP
 	mov	dword [r12+C_OUT_CAP],OUT_CAP
 	mov	qword [r12+C_IN_LARGE],0	; and C_OUT_LARGE
+	mov	qword [r12+C_T0],0
+	mov	dword [r12+C_PEER_STATE],PEER_UNKNOWN
+	metric_inc M_ACCEPTED
 	mov	[r12+C_FIDX],r14d
 	mov	rcx,[g_conn_gens]
 	mov	eax,[rcx+rbx*4]
@@ -454,13 +461,13 @@ conn_flush:
 	test	eax,F_CLOSE_AFTER
 	jz	.read_more
 	; The last response may still be owed by the database or the hasher.
-	test	eax,F_SEND or F_LINGER or F_WAIT_DB
+	test	eax,F_SEND or F_LINGER or F_WAIT_DB or F_WAIT_PEER
 	jnz	.done
 	jmp	start_linger
 .read_more:
 	; Waiting on output or on the database: stop reading, so TCP pushes
 	; back on the client instead of our buffers filling up.
-	test	eax,F_RECV or F_WAIT_OUT or F_WAIT_DB
+	test	eax,F_RECV or F_WAIT_OUT or F_WAIT_DB or F_WAIT_PEER
 	jnz	.done
 	jmp	arm_recv
 .done:
@@ -551,7 +558,7 @@ process_input:
 	jz	.compact
 	test	dword [r12+C_FLAGS],F_CLOSE_AFTER
 	jnz	.discard
-	test	dword [r12+C_FLAGS],F_WAIT_DB
+	test	dword [r12+C_FLAGS],F_WAIT_DB or F_WAIT_PEER
 	jnz	.compact			; answer in order: wait for the reply
 	mov	eax,[r12+C_OUT_CAP]
 	sub	eax,[r12+C_OUT_LEN]
@@ -566,6 +573,8 @@ process_input:
 	je	.large
 	cmp	eax,HTTP_WAIT_OUTPUT
 	je	.wait_out			; after the pending output is sent
+	cmp	eax,HTTP_WAIT_PEER
+	je	.wait_peer
 	add	r13d,eax
 	jmp	.next
 .large:
@@ -574,6 +583,7 @@ process_input:
 	call	.shift
 	call	conn_large_input
 	jnc	.next
+	metric_inc M_LARGE_EXHAUSTED
 	or	dword [r12+C_FLAGS],F_CLOSE_AFTER
 	call	respond_busy
 	jmp	.discard
@@ -589,6 +599,9 @@ process_input:
 	call	respond_status
 .discard:
 	mov	r13d,[r12+C_IN_LEN]
+	jmp	.compact
+.wait_peer:
+	or	dword [r12+C_FLAGS],F_WAIT_PEER
 	jmp	.compact
 .wait_out:
 	or	dword [r12+C_FLAGS],F_WAIT_OUT

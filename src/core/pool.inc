@@ -141,6 +141,7 @@ pool_trim:
 	mov	edx,MADV_DONTNEED
 	mov	eax,SYS_madvise
 	syscall
+	metric_add M_RETURNED, rsi
 	inc	r12d
 	dec	r13d
 	jmp	.next

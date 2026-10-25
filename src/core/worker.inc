@@ -94,6 +94,7 @@ worker_main:
 	call	arm_signal
 
 	call	tsc_calibrate
+	call	metrics_worker
 	mov	eax,[g_busy_poll_us]
 	imul	rax,[g_tsc_per_us]
 	mov	[g_spin_ticks],rax
@@ -182,8 +183,6 @@ worker_main:
 
 ; TSC ticks per microsecond (the TSC is invariant on every x86-64-v3 CPU).
 tsc_calibrate:
-	cmp	dword [g_busy_poll_us],0
-	je	.done
 	rdtsc
 	shl	rdx,32
 	or	rax,rdx
@@ -270,6 +269,7 @@ on_timer:
 	call	pg_tick
 	call	hasher_tick
 	call	conn_trim
+	call	metrics_tick
 
 	cmp	dword [g_accept_paused],0
 	je	.sweep_start
@@ -321,7 +321,7 @@ on_timer:
 	mov	ecx,LINGER_TIMEOUT
 	jmp	.check
 @@:
-	test	eax,F_SEND or F_WAIT_DB
+	test	eax,F_SEND or F_WAIT_DB or F_WAIT_PEER
 	jnz	.busy
 	cmp	dword [r12+C_IN_LEN],0
 	je	.check
@@ -374,7 +374,7 @@ on_signal:
 	jne	.each
 	cmp	dword [r12+C_IN_LEN],0
 	jne	.each
-	test	dword [r12+C_FLAGS],F_SEND or F_LINGER or F_WAIT_DB
+	test	dword [r12+C_FLAGS],F_SEND or F_LINGER or F_WAIT_DB or F_WAIT_PEER
 	jnz	.each
 	call	close_conn
 	jmp	.each

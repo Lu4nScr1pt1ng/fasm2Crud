@@ -1,7 +1,8 @@
 #!/usr/bin/env sh
 # Integration checks against the compose PostgreSQL (make up first):
 # SCRAM login and a pipelined round trip, a wrong password failing fast,
-# the account and notes endpoints, memory that comes back, and recovery after the database restarts.
+# the account and notes endpoints, memory that comes back, rate limits,
+# metrics, and recovery after the database restarts.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -19,11 +20,11 @@ wait_ready() {
 
 # A known signing key, so tests/auth_api.py can check tokens independently.
 KEY="$(head -c32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')"
-API_TOKEN_KEY="$KEY" API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+API_TOKEN_KEY="$KEY" API_AUTH_RATE=100000 API_AUTH_BURST=100000 API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
 good=$!
 API_PORT=18091 API_WORKERS=1 API_DB_HOST="$HOST" API_DB_PASSWORD=wrong ./build/fasm2crud 2>/dev/null &
 bad=$!
-trap 'kill $good $bad ${mem:-} 2>/dev/null || true' EXIT
+trap 'kill $good $bad ${mem:-} ${rl:-} ${met:-} 2>/dev/null || true' EXIT
 
 wait_ready 18090 || true
 check "readyz through SCRAM and the query pipeline" 200 "$(code 18090)"
@@ -37,6 +38,20 @@ mem=$!
 wait_ready 18092 || true
 python3 -I tests/memory_api.py 18092 || status=1
 kill $mem 2>/dev/null || true
+
+# Per-address limits on the account endpoints.
+API_PORT=18093 API_WORKERS=1 API_AUTH_RATE=6 API_AUTH_BURST=3 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+rl=$!
+wait_ready 18093 || true
+python3 -I tests/ratelimit_api.py 18093 || status=1
+kill $rl 2>/dev/null || true
+
+# /metrics adds up every worker and survives a worker restart.
+API_PORT=18094 API_WORKERS=4 ./build/fasm2crud 2>/dev/null &
+met=$!
+sleep 0.5
+python3 -I tests/metrics_api.py 18094 || status=1
+kill $met 2>/dev/null || true
 
 docker compose restart postgres >/dev/null 2>&1
 if wait_ready 18090; then r=200; else r="$(code 18090)"; fi

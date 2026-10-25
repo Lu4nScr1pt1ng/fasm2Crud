@@ -268,6 +268,7 @@ hasher_submit:
 	or	dword [r15+AC_FLAGS],ACF_HASHING
 	inc	dword [g_hasher_jobs]
 	mov	dword [g_hasher_dirty],1
+	metric_inc M_HASH_JOBS
 	or	dword [r12+C_FLAGS],F_WAIT_DB
 	xor	eax,eax
 	pop	r15
@@ -280,6 +281,7 @@ hasher_submit:
 	pop	r14
 	pop	r13
 .busy:
+	metric_inc M_HASH_BUSY
 	mov	eax,-1
 	ret
 
@@ -315,6 +317,7 @@ hasher_down:
 	call	log_str
 	call	log_end
 	mov	dword [g_hasher_up],0
+	metric_inc M_HASH_RESTARTS
 	mov	edi,[g_hasher_fd]
 	mov	eax,SYS_close
 	syscall

@@ -1,7 +1,7 @@
 ; Request framing and response writing.
 
-cstring hdr_common, 'Content-Type: application/json',13,10, \
-		    'X-Content-Type-Options: nosniff',13,10, \
+cstring hdr_json, 'Content-Type: application/json',13,10
+cstring hdr_common, 'X-Content-Type-Options: nosniff',13,10, \
 		    'Cache-Control: no-store',13,10, \
 		    'Content-Length: '
 cstring hdr_close, 'Connection: close',13,10
@@ -9,6 +9,7 @@ cstring hdr_no_store, 'Cache-Control: no-store',13,10
 
 HTTP_WAIT_OUTPUT = -1		; retry once the pending output is sent
 HTTP_LARGE_INPUT = -2		; retry from a large input buffer
+HTTP_WAIT_PEER	= -3		; retry once the client address is known
 
 RESP_HEAD_ROOM	= 512		; room before a body built in place (respond_built)
 
@@ -59,6 +60,12 @@ http_handle:
 	cmp	dword [r12+C_OUT_LEN],0
 	jne	.defer
 @@:
+	; Rate-limited routes need the client address.
+	push	rcx
+	call	route_needs_peer
+	pop	rcx
+	test	eax,eax
+	jnz	.wait_peer
 	mov	dword [r12+C_SCAN],0
 	lea	rax,[r13+r15]
 	mov	[req_body],rax
@@ -81,6 +88,10 @@ http_handle:
 	or	dword [r12+C_FLAGS],F_CLOSE_AFTER
 .route:
 	push	rcx
+	rdtsc					; the request is timed from here
+	shl	rdx,32
+	or	rax,rdx
+	mov	[r12+C_T0],rax
 	call	route
 	pop	rax
 	jmp	.done
@@ -98,6 +109,10 @@ http_handle:
 .defer:
 	mov	dword [r12+C_SCAN],0
 	mov	eax,HTTP_WAIT_OUTPUT
+	jmp	.done
+.wait_peer:
+	mov	dword [r12+C_SCAN],0
+	mov	eax,HTTP_WAIT_PEER
 	jmp	.done
 .need_body:
 	lea	eax,[r15-4]
@@ -143,6 +158,7 @@ respond:
 	mov	eax,[r12+C_OUT_LEN]
 	mov	rdi,[r12+C_OUT_BUF]
 	add	rdi,rax
+	xor	r9d,r9d
 	call	http_head
 	mov	rsi,r13
 	mov	ecx,r14d
@@ -153,9 +169,11 @@ respond:
 	pop	r13
 	ret
 
-; Status line and headers of a JSON response, written at rdi (advanced).
+; Status line and headers of a response, written at rdi (advanced).
 ; r12 = connection, esi = ST_xxx, edx = body length, rcx = extra header
-; lines, r8d = their length. At most 256 bytes plus the extra lines.
+; lines, r8d = their length, r9 = Content-Type line (r10d = its length),
+; or 0 for JSON. At most 256 bytes plus the extra lines. Every response
+; goes through here or respond_no_content, which is where they are counted.
 http_head:
 	push	r13
 	push	r14
@@ -163,6 +181,7 @@ http_head:
 	mov	r13d,edx
 	mov	r14,rcx
 	mov	r15d,r8d
+	call	metrics_response
 	mov	eax,esi
 	shl	eax,5
 	mov	rsi,[status_tbl+rax]
@@ -170,6 +189,14 @@ http_head:
 	rep	movsb
 	lea	rsi,[g_date_line]
 	mov	ecx,DATE_LINE_LEN
+	rep	movsb
+	mov	rsi,r9
+	mov	ecx,r10d
+	test	r9,r9
+	jnz	@f
+	lea	rsi,[hdr_json]
+	mov	ecx,hdr_json.len
+@@:
 	rep	movsb
 	lea	rsi,[hdr_common]
 	mov	ecx,hdr_common.len
@@ -213,13 +240,17 @@ respond_reserve:
 	clc
 	ret
 .busy:
+	metric_inc M_LARGE_EXHAUSTED
 	call	respond_busy
 	stc
 	ret
 
 ; respond_built: edi = ST_xxx, edx = body length (written where
 ; respond_reserve said), rcx / r8d = extra header lines (<= 128 bytes).
+; respond_built_typed: the same with r9 / r10d = Content-Type line.
 respond_built:
+	xor	r9d,r9d
+respond_built_typed:
 	push	r13
 	push	r14
 	mov	r13d,edx
@@ -246,6 +277,8 @@ respond_built:
 ; 204: no body, and so no Content-Type or Content-Length (RFC 9110 8.6).
 ; r12 = connection.
 respond_no_content:
+	mov	esi,ST_204
+	call	metrics_response
 	mov	eax,[r12+C_OUT_LEN]
 	mov	rdi,[r12+C_OUT_BUF]
 	add	rdi,rax
@@ -270,6 +303,25 @@ respond_no_content:
 	add	rdi,2
 	sub	rdi,[r12+C_OUT_BUF]
 	mov	[r12+C_OUT_LEN],edi
+	ret
+
+; rax = value (64 bits), rdi = destination; rdi is advanced.
+write_u64:
+	sub	rsp,24
+	lea	rsi,[rsp+24]
+	mov	ecx,10
+@@:
+	xor	edx,edx
+	div	rcx
+	add	dl,'0'
+	dec	rsi
+	mov	[rsi],dl
+	test	rax,rax
+	jnz	@b
+	lea	rcx,[rsp+24]
+	sub	rcx,rsi
+	rep	movsb
+	add	rsp,24
 	ret
 
 ; eax = value, rdi = destination; rdi is advanced past the digits.

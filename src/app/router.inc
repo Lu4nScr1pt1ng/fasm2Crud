@@ -59,8 +59,11 @@ route:
 .len8:
 	mov	rax,'/healthz'
 	cmp	[rsi],rax
-	jne	.not_found
-	jmp	.health
+	je	.health
+	mov	rax,'/metrics'
+	cmp	[rsi],rax
+	je	metrics_route
+	jmp	.not_found
 .len7:
 	cmp	dword [rsi],'/rea'
 	jne	.not_found
@@ -97,6 +100,10 @@ route:
 	mov	edi,ST_501
 	jmp	respond_status
 
+; 405 for a GET-only route.
+route_get_only:
+	jmp	route.get_only
+
 ; Routes with large bodies (notes). ZF clear (and eax = 1) for them.
 route_is_notes:
 	xor	eax,eax
@@ -114,9 +121,19 @@ route_is_notes:
 	ret
 
 ; eax = 1 when the route builds its responses in place (respond_built),
-; which needs an empty output buffer to start from.
+; which needs an empty output buffer to start from: notes and /metrics.
 route_output_need:
-	jmp	route_is_notes
+	call	route_is_notes
+	jnz	.done
+	cmp	dword [req_path_len],8
+	jne	.done
+	mov	rdx,[req_path]
+	mov	rcx,'/metrics'
+	cmp	[rdx],rcx
+	jne	.done
+	inc	eax
+.done:
+	ret
 
 ; eax = the largest request the route accepts: notes take large buffers,
 ; everything else fits the slot.
