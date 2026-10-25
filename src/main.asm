@@ -18,6 +18,7 @@ segment readable executable
 include 'core/util.inc'
 include 'core/start.inc'
 include 'core/supervisor.inc'
+include 'core/seccomp.inc'
 include 'core/worker.inc'
 include 'core/ring.inc'
 include 'core/pool.inc'

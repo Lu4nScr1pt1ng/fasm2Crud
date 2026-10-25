@@ -81,6 +81,9 @@ worker_main:
 	call	ring_register_files
 	test	eax,eax
 	js	.no_files
+	call	ring_lockdown
+	test	eax,eax
+	js	.no_lockdown
 
 	call	date_init
 	call	auth_ctx_init
@@ -94,6 +97,8 @@ worker_main:
 	mov	eax,[g_busy_poll_us]
 	imul	rax,[g_tsc_per_us]
 	mov	[g_spin_ticks],rax
+	; Set up: from here on only what serving needs.
+	call	seccomp_worker
 
 	; While work keeps arriving, poll the ring without sleeping for up to
 	; API_BUSY_POLL_US after the last completion: sleeping and being woken
@@ -157,6 +162,11 @@ worker_main:
 	call	log_end
 	mov	edi,EXIT_FATAL
 	jmp	exit_process
+.no_lockdown:
+	push	rax
+	call	log_begin
+	log_lit 'cannot restrict the io_uring operations (errno '
+	jmp	.fatal
 .no_files:
 	push	rax
 	call	log_begin

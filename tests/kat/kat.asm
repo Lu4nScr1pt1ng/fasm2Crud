@@ -24,6 +24,7 @@ include '../../src/crypto/phc.inc'
 include '../../src/app/validate.inc'
 include '../../src/auth/ctx.inc'
 include '../../src/auth/token.inc'
+include '../../src/core/seccomp.inc'
 
 ; write_u32 lives in the HTTP handler; the tests only need this copy.
 write_u32:
@@ -383,8 +384,104 @@ start:
 	mov	dword [kat_failed],1
 .finish:
 	call	token_tests
+	call	seccomp_tests
 	mov	edi,[kat_failed]
 	jmp	exit_process
+
+; Each case runs in a child confined like a worker (both filters): it
+; makes one system call and exits 0 if the call came back. Refused calls
+; must end in the SIGSYS handler (exit status 1), allowed ones in 0.
+; Record: dd nr, expect (1 refused, 0 allowed), name length, record size;
+; dq args 0..2; the name.
+macro sc_case name*, nr*, expect*, a0*, a1*, a2*
+	local start, n, e
+	rodata
+		align 8
+		start:
+		dd nr, expect, e - n, e - start
+		dq a0, a1, a2
+		n: db name
+		e:
+	end rodata
+end macro
+cstring sc_path, '/etc/passwd',0
+rodata
+	align 8
+	sc_cases:
+end rodata
+sc_case 'seccomp refuses openat', 257, 1, -100, sc_path, 0
+sc_case 'seccomp refuses execve', 59, 1, sc_path, 0, 0
+sc_case 'seccomp refuses ptrace', 101, 1, 0, 0, 0
+sc_case 'seccomp refuses clone', 56, 1, 0, 0, 0
+sc_case 'seccomp refuses an executable mmap', 9, 1, 0, 4096, PROT_READ or PROT_EXEC
+sc_case 'seccomp refuses AF_INET6 sockets', 41, 1, 10, 1, 0
+sc_case 'seccomp refuses prctl(PR_SET_PTRACER)', 157, 1, 0x59616d61, 0, 0
+sc_case 'seccomp refuses io_uring_setup in a worker', 425, 1, 8, 0, 0
+sc_case 'seccomp allows getpid', 39, 0, 0, 0, 0
+sc_case 'seccomp allows an AF_INET socket', 41, 0, AF_INET, SOCK_STREAM, 0
+rodata
+	align 8
+	sc_cases_end:
+end rodata
+
+seccomp_tests:
+	push	rbx
+	push	r12
+	sub	rsp,136
+	lea	rbx,[sc_cases]
+.case:
+	lea	rax,[sc_cases_end]
+	cmp	rbx,rax
+	jae	.done
+	mov	eax,SYS_fork
+	syscall
+	test	eax,eax
+	jz	.child
+	mov	r12d,eax
+	mov	edi,1				; P_PID
+	mov	esi,r12d
+	mov	rdx,rsp
+	mov	r10d,WEXITED
+	xor	r8d,r8d
+	mov	eax,SYS_waitid
+	syscall
+	xor	eax,eax
+	cmp	dword [rsp+SI_CODE],CLD_EXITED
+	jne	.report
+	mov	ecx,[rsp+SI_STATUS]
+	cmp	ecx,[rbx+4]			; 1: the handler ran, 0: allowed
+	sete	al
+.report:
+	lea	rsi,[rbx+40]
+	mov	edx,[rbx+8]
+	call	report_bool
+	mov	eax,[rbx+12]
+	add	eax,7
+	and	eax,-8
+	add	rbx,rax
+	jmp	.case
+.child:
+	; The handler's log line would be noise here: no stderr.
+	mov	edi,2
+	mov	eax,SYS_close
+	syscall
+	call	seccomp_supervisor
+	call	seccomp_worker
+	mov	eax,[rbx]
+	mov	rdi,[rbx+16]
+	mov	rsi,[rbx+24]
+	mov	rdx,[rbx+32]
+	mov	r10d,MAP_PRIVATE or MAP_ANONYMOUS
+	mov	r8,-1
+	xor	r9d,r9d
+	syscall
+	xor	edi,edi
+	jmp	exit_process
+.done:
+	add	rsp,136
+	pop	r12
+	pop	rbx
+	ret
 
 rodata
 	kt_user	db 0x01,0x8f,0x2a,0x11,0x22,0x33,0x74,0x44,0x85,0x55,0x66,0x77,0x88,0x99,0xaa,0xbb

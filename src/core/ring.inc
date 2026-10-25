@@ -6,6 +6,8 @@
 ;   SUBMIT_ALL                     a failing SQE does not stall the ones after it
 ;   NO_SQARRAY                     SQ tail indexes the SQE array directly
 ;   CQSIZE                         completion queue 4x the submission queue
+;   R_DISABLED                     created disabled, enabled by ring_lockdown
+;                                  once its restrictions are in place
 
 bss
 	align 8
@@ -35,7 +37,7 @@ ring_init:
 	xor	eax,eax
 	mov	ecx,UP_SIZE/8
 	rep	stosq
-	mov	dword [g_uparams+UP_FLAGS],IORING_SETUP_SINGLE_ISSUER or IORING_SETUP_DEFER_TASKRUN or IORING_SETUP_SUBMIT_ALL or IORING_SETUP_NO_SQARRAY or IORING_SETUP_CQSIZE or IORING_SETUP_CLAMP
+	mov	dword [g_uparams+UP_FLAGS],IORING_SETUP_SINGLE_ISSUER or IORING_SETUP_DEFER_TASKRUN or IORING_SETUP_SUBMIT_ALL or IORING_SETUP_NO_SQARRAY or IORING_SETUP_CQSIZE or IORING_SETUP_CLAMP or IORING_SETUP_R_DISABLED
 	mov	dword [g_uparams+UP_CQ_ENTRIES],CQ_ENTRIES
 	mov	edi,RING_ENTRIES
 	lea	rsi,[g_uparams]
@@ -156,6 +158,44 @@ ring_register_files:
 	mov	eax,SYS_io_uring_register
 	syscall
 	add	rsp,40
+	ret
+
+; Seccomp does not see io_uring operations, so the ring gets its own
+; allowlist: only the opcodes and SQE flags the server uses, and no
+; io_uring_register operation at all once it is enabled. Called after the
+; files are registered. eax = 0 or -errno.
+rodata
+	align 8
+	ring_restrictions:
+	irp op, IORING_OP_NOP, IORING_OP_TIMEOUT, IORING_OP_ACCEPT, IORING_OP_ASYNC_CANCEL, \
+		IORING_OP_LINK_TIMEOUT, IORING_OP_CONNECT, IORING_OP_CLOSE, IORING_OP_READ, \
+		IORING_OP_SEND, IORING_OP_RECV, IORING_OP_SHUTDOWN, IORING_OP_URING_CMD
+		dw IORING_RESTRICTION_SQE_OP
+		db op, 0
+		dd 0, 0, 0
+	end irp
+	dw IORING_RESTRICTION_SQE_FLAGS_ALLOWED
+	db IOSQE_FIXED_FILE or IOSQE_IO_LINK or IOSQE_CQE_SKIP_SUCCESS, 0
+	dd 0, 0, 0
+	RING_RESTRICTIONS_COUNT = ($ - ring_restrictions) / 16
+end rodata
+
+ring_lockdown:
+	mov	edi,[g_ring_fd]
+	mov	esi,IORING_REGISTER_RESTRICTIONS
+	lea	rdx,[ring_restrictions]
+	mov	r10d,RING_RESTRICTIONS_COUNT
+	mov	eax,SYS_io_uring_register
+	syscall
+	test	eax,eax
+	js	.done
+	mov	edi,[g_ring_fd]
+	mov	esi,IORING_REGISTER_ENABLE_RINGS
+	xor	edx,edx
+	xor	r10d,r10d
+	mov	eax,SYS_io_uring_register
+	syscall
+.done:
 	ret
 
 ; rax = zeroed SQE. Flushes the queue when it is full.

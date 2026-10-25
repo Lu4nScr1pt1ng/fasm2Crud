@@ -85,6 +85,9 @@ supervisor_main:
 	log_lit ' connections each'
 	call	log_end
 
+	; From here on the supervisor and everything it forks are confined.
+	call	seccomp_supervisor
+
 	xor	ebx,ebx
 .spawn_all:
 	mov	edi,ebx
