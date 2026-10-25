@@ -518,8 +518,15 @@ header_field:
 	ret
 
 ; Connection header: comma separated tokens; only "close" and "keep-alive"
-; matter. r12 = value, r13 = length. eax = 0.
+; matter. r12 = value, r13 = length. eax = 0. Preserves rsi: it is the
+; header loop's cursor.
 connection_tokens:
+	push	rsi
+	call	.scan
+	pop	rsi
+	xor	eax,eax
+	ret
+.scan:
 	mov	rsi,r12
 	lea	rdi,[r12+r13]
 .skip:

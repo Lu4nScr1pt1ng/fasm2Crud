@@ -259,6 +259,7 @@ on_timer:
 	call	date_update
 	call	pg_tick
 	call	hasher_tick
+	call	conn_trim
 
 	cmp	dword [g_accept_paused],0
 	je	.sweep_start
@@ -287,6 +288,22 @@ on_timer:
 	cmp	eax,[g_drain_deadline]
 	jae	.expire
 .deadline:
+	; Large buffers have a total deadline on top of the progress ones, so
+	; slow clients cannot hold the pool.
+	cmp	dword [r12+C_IN_LARGE],0
+	je	@f
+	mov	eax,[g_tick]
+	sub	eax,[r12+C_IN_SINCE]
+	cmp	eax,REQUEST_TIMEOUT
+	jae	.expire
+@@:
+	cmp	dword [r12+C_OUT_LARGE],0
+	je	@f
+	mov	eax,[g_tick]
+	sub	eax,[r12+C_OUT_SINCE]
+	cmp	eax,LARGE_HOLD
+	jae	.expire
+@@:
 	mov	ecx,IDLE_TIMEOUT
 	mov	eax,[r12+C_FLAGS]
 	test	eax,F_LINGER

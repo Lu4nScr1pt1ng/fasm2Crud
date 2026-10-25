@@ -7,6 +7,7 @@ SYS_write		= 1
 SYS_close		= 3
 SYS_mmap		= 9
 SYS_mprotect		= 10
+SYS_madvise		= 28
 SYS_rt_sigaction	= 13
 SYS_rt_sigprocmask	= 14
 SYS_nanosleep		= 35
@@ -56,6 +57,7 @@ MAP_PRIVATE	= 0x02
 MAP_ANONYMOUS	= 0x20
 MAP_NORESERVE	= 0x4000
 MAP_POPULATE	= 0x8000
+MADV_DONTNEED	= 4
 PAGE_SIZE	= 4096
 
 ; signals

@@ -4,9 +4,19 @@
 ;   [0, 256)          header (fields below)
 ;   [256, 8192)       input buffer: requests are parsed in place
 ;   [8192, 16384)     output buffer: responses are written in place
-; Slots come from a LIFO free list, so the most recently used (cache-hot,
-; already faulted-in) memory is reused first and resident memory tracks the
-; number of concurrent connections, not the configured maximum.
+; Slots come from a pool (src/core/pool.inc): the most recently used,
+; cache-hot slot is reused first, so resident memory tracks the number of
+; concurrent connections, and slots left idle give all their pages back.
+; The generation counter of each slot (which tells late database and
+; hasher replies from a new connection's) lives apart, in g_conn_gens,
+; and is copied into the header on accept.
+;
+; A request or a response that does not fit its buffer (a large note)
+; borrows a large buffer from a second pool for as long as it needs it:
+; C_IN_BUF / C_OUT_BUF then point there instead of into the slot. A large
+; input buffer goes back once the input is consumed, a large output buffer
+; once its bytes are sent; holding one has a total deadline as well, so
+; slow clients cannot keep the pool.
 ;
 ; At most one recv and one send are in flight per connection. While output
 ; is backed up (F_WAIT_OUT) we stop reading, so a client that sends faster
@@ -24,7 +34,26 @@ C_SCAN		= 32		; where the header terminator search resumes
 C_FIDX		= 36		; direct descriptor index
 C_LINGER	= 40		; bytes discarded during lingering close
 C_AUX		= 44		; a value the current request keeps for its continuation
-C_GEN		= 64		; bumped per accept; outside the zeroed header
+C_GEN		= 64		; copy of g_conn_gens[slot]; 0 in a free (trimmed) slot
+; Set on accept (outside the zeroed header too):
+C_IN_BUF	= 72		; dq: input buffer, in the slot or a large buffer
+C_OUT_BUF	= 80		; dq: output buffer
+C_IN_CAP	= 88
+C_OUT_CAP	= 92
+C_IN_LARGE	= 96		; large buffer index + 1, or 0
+C_OUT_LARGE	= 100
+C_IN_SINCE	= 104		; tick the large buffers were taken
+C_OUT_SINCE	= 108
+
+CONN_KEEP	= 0		; the whole slot can go back
+CONN_WARM	= 64		; free slots always kept resident
+
+LARGE_SHIFT	= 17
+LARGE_SIZE	= 1 shl LARGE_SHIFT	; 128 KiB
+LARGE_CAP	= LARGE_SIZE - 64	; SIMD scans may read 31 bytes past the data
+LARGE_WARM	= 2
+LARGE_HOLD	= 60		; ticks a connection may keep a large output buffer
+DEFAULT_LARGE_BUFFERS = 64	; per worker
 
 CS_FREE		= 0
 CS_OPEN		= 1
@@ -47,9 +76,11 @@ bss
 	align 8
 	g_conn_base	dq ?
 	g_active_list	dq ?
-	g_free_list	dq ?
-	g_free_top	dd ?
+	g_conn_gens	dq ?		; u32 per slot, never trimmed
 	g_active_count	dd ?
+	g_large_count	dd ?
+	g_conn_pool:	rb P_SIZE
+	g_large_pool:	rb P_SIZE
 	g_accept_armed	dd ?
 	g_accept_paused	dd ?
 end bss
@@ -80,12 +111,24 @@ conn_pool_init:
 	test	eax,eax
 	js	.done
 
-	; Active list and free list: max_conns u32 each.
+	mov	rax,[g_conn_base]
+	mov	[g_conn_pool+P_BASE],rax
+	mov	dword [g_conn_pool+P_SHIFT],CONN_SHIFT
+	mov	dword [g_conn_pool+P_KEEP],CONN_KEEP
+	mov	eax,[g_max_conns]
+	mov	[g_conn_pool+P_COUNT],eax
+	mov	dword [g_conn_pool+P_WARM],CONN_WARM
+	lea	rdi,[g_conn_pool]
+	call	pool_init
+	test	eax,eax
+	js	.done
+
+	; Active list and generations: max_conns u32 each.
 	xor	edi,edi
 	mov	esi,[g_max_conns]
 	shl	esi,3
 	mov	edx,PROT_READ or PROT_WRITE
-	mov	r10d,MAP_PRIVATE or MAP_ANONYMOUS or MAP_POPULATE
+	mov	r10d,MAP_PRIVATE or MAP_ANONYMOUS
 	mov	r8,-1
 	xor	r9d,r9d
 	mov	eax,SYS_mmap
@@ -94,20 +137,111 @@ conn_pool_init:
 	jae	.done
 	mov	[g_active_list],rax
 	mov	ecx,[g_max_conns]
-	lea	rdx,[rax+rcx*4]
-	mov	[g_free_list],rdx
-	mov	[g_free_top],ecx
-	; free_list[i] = max - 1 - i, so slot 0 is popped first.
-	xor	eax,eax
-@@:
-	dec	ecx
-	mov	[rdx+rax*4],ecx
-	inc	eax
-	test	ecx,ecx
-	jnz	@b
-	xor	eax,eax
+	lea	rax,[rax+rcx*4]
+	mov	[g_conn_gens],rax
+
+	; Large buffers: address space only, until a request needs one.
+	mov	eax,[g_large_count]
+	shl	rax,LARGE_SHIFT
+	xor	edi,edi
+	mov	rsi,rax
+	mov	edx,PROT_READ or PROT_WRITE
+	mov	r10d,MAP_PRIVATE or MAP_ANONYMOUS or MAP_NORESERVE
+	mov	r8,-1
+	xor	r9d,r9d
+	mov	eax,SYS_mmap
+	syscall
+	cmp	rax,-4095
+	jae	.done
+	mov	[g_large_pool+P_BASE],rax
+	mov	dword [g_large_pool+P_SHIFT],LARGE_SHIFT
+	mov	dword [g_large_pool+P_KEEP],0
+	mov	eax,[g_large_count]
+	mov	[g_large_pool+P_COUNT],eax
+	mov	dword [g_large_pool+P_WARM],LARGE_WARM
+	lea	rdi,[g_large_pool]
+	call	pool_init
 .done:
 	pop	rbx
+	ret
+
+; Once per tick: give back the memory of idle slots and buffers.
+conn_trim:
+	lea	rdi,[g_conn_pool]
+	call	pool_trim
+	lea	rdi,[g_large_pool]
+	jmp	pool_trim
+
+; Move the input to a large buffer (the request is at its start).
+; CF when none is free.
+conn_large_input:
+	lea	rdi,[g_large_pool]
+	call	pool_take
+	jc	.done
+	lea	ecx,[rax+1]
+	mov	[r12+C_IN_LARGE],ecx
+	mov	esi,eax
+	lea	rdi,[g_large_pool]
+	call	pool_ptr
+	mov	rdi,rax
+	mov	rsi,[r12+C_IN_BUF]
+	mov	[r12+C_IN_BUF],rax
+	mov	dword [r12+C_IN_CAP],LARGE_CAP
+	mov	ecx,[r12+C_IN_LEN]
+	rep	movsb
+	mov	eax,[g_tick]
+	mov	[r12+C_IN_SINCE],eax
+	clc
+.done:
+	ret
+
+; Back to the slot's input buffer. Requires C_IN_LEN = 0 and no recv in
+; flight.
+conn_inline_input:
+	mov	esi,[r12+C_IN_LARGE]
+	test	esi,esi
+	jz	.done
+	dec	esi
+	mov	dword [r12+C_IN_LARGE],0
+	lea	rax,[r12+IN_OFF]
+	mov	[r12+C_IN_BUF],rax
+	mov	dword [r12+C_IN_CAP],IN_CAP
+	lea	rdi,[g_large_pool]
+	jmp	pool_put
+.done:
+	ret
+
+; Switch the (empty) output to a large buffer. CF when none is free.
+conn_large_output:
+	lea	rdi,[g_large_pool]
+	call	pool_take
+	jc	.done
+	lea	ecx,[rax+1]
+	mov	[r12+C_OUT_LARGE],ecx
+	mov	esi,eax
+	lea	rdi,[g_large_pool]
+	call	pool_ptr
+	mov	[r12+C_OUT_BUF],rax
+	mov	dword [r12+C_OUT_CAP],LARGE_CAP
+	mov	eax,[g_tick]
+	mov	[r12+C_OUT_SINCE],eax
+	clc
+.done:
+	ret
+
+; Back to the slot's output buffer. Requires everything sent.
+conn_inline_output:
+	mov	esi,[r12+C_OUT_LARGE]
+	test	esi,esi
+	jz	.done
+	dec	esi
+	mov	dword [r12+C_OUT_LARGE],0
+	lea	rax,[r12+OUT_OFF]
+	mov	[r12+C_OUT_BUF],rax
+	mov	dword [r12+C_OUT_CAP],OUT_CAP
+	lea	rdi,[g_large_pool]
+	jmp	pool_put
+.done:
 	ret
 
 arm_accept:
@@ -130,21 +264,32 @@ on_accept:
 @@:
 	test	r14d,r14d
 	js	.failed
-	mov	eax,[g_free_top]
-	test	eax,eax
-	jz	.no_slot
-	dec	eax
-	mov	[g_free_top],eax
-	mov	rcx,[g_free_list]
-	mov	ebx,[rcx+rax*4]
+	lea	rdi,[g_conn_pool]
+	call	pool_take
+	jc	.no_slot
+	mov	ebx,eax
 	conn_ptr r12,rbx
 	vpxor	xmm0,xmm0,xmm0
 	vmovdqu	[r12],xmm0
 	vmovdqu	[r12+16],xmm0
 	vmovdqu	[r12+32],xmm0
 	vmovdqu	[r12+48],xmm0
+	lea	rax,[r12+IN_OFF]
+	mov	[r12+C_IN_BUF],rax
+	lea	rax,[r12+OUT_OFF]
+	mov	[r12+C_OUT_BUF],rax
+	mov	dword [r12+C_IN_CAP],IN_CAP
+	mov	dword [r12+C_OUT_CAP],OUT_CAP
+	mov	qword [r12+C_IN_LARGE],0	; and C_OUT_LARGE
 	mov	[r12+C_FIDX],r14d
-	inc	dword [r12+C_GEN]
+	mov	rcx,[g_conn_gens]
+	mov	eax,[rcx+rbx*4]
+	inc	eax
+	jnz	@f
+	inc	eax				; 0 never names a connection
+@@:
+	mov	[rcx+rbx*4],eax
+	mov	[r12+C_GEN],eax
 	mov	dword [r12+C_STATE],CS_OPEN
 	mov	eax,[g_tick]
 	mov	[r12+C_LAST],eax
@@ -201,8 +346,8 @@ arm_recv:
 	mov	byte [rax+SQE_FLAGS],IOSQE_FIXED_FILE
 	mov	ecx,[r12+C_FIDX]
 	mov	[rax+SQE_FD],ecx
-	lea	rcx,[r12+IN_OFF]
-	mov	edx,IN_CAP
+	mov	rcx,[r12+C_IN_BUF]
+	mov	edx,[r12+C_IN_CAP]
 	test	dword [r12+C_FLAGS],F_LINGER
 	jnz	@f				; lingering: overwrite, we only discard
 	mov	esi,[r12+C_IN_LEN]
@@ -225,7 +370,8 @@ arm_send:
 	mov	ecx,[r12+C_FIDX]
 	mov	[rax+SQE_FD],ecx
 	mov	ecx,[r12+C_OUT_SENT]
-	lea	rdx,[r12+OUT_OFF+rcx]
+	mov	rdx,[r12+C_OUT_BUF]
+	add	rdx,rcx
 	mov	[rax+SQE_ADDR],rdx
 	mov	edx,[r12+C_OUT_LEN]
 	sub	edx,ecx
@@ -286,6 +432,7 @@ on_send:
 	xor	eax,eax
 	mov	[r12+C_OUT_LEN],eax
 	mov	[r12+C_OUT_SENT],eax
+	call	conn_inline_output
 	test	dword [r12+C_FLAGS],F_WAIT_OUT
 	jz	conn_flush
 	and	dword [r12+C_FLAGS],not F_WAIT_OUT
@@ -380,13 +527,12 @@ conn_release:
 	mov	[rcx+rsi*4],edx
 	conn_ptr rdi,rdx
 	mov	[rdi+C_ACTIVE_POS],esi
-	; Push the slot on the free list.
-	mov	rcx,[g_free_list]
-	mov	eax,[g_free_top]
-	mov	[rcx+rax*4],ebx
-	inc	eax
-	mov	[g_free_top],eax
-	ret
+	; Nothing references the buffers any more.
+	call	conn_inline_input
+	call	conn_inline_output
+	lea	rdi,[g_conn_pool]
+	mov	esi,ebx
+	jmp	pool_put
 
 ; A database or hasher reply was handled (F_WAIT_DB is clear unless the
 ; request waits again): carry on with the input.
@@ -407,21 +553,35 @@ process_input:
 	jnz	.discard
 	test	dword [r12+C_FLAGS],F_WAIT_DB
 	jnz	.compact			; answer in order: wait for the reply
-	mov	eax,OUT_CAP
+	mov	eax,[r12+C_OUT_CAP]
 	sub	eax,[r12+C_OUT_LEN]
 	cmp	eax,RESP_RESERVE
 	jb	.wait_out
-	lea	rdi,[r12+IN_OFF+r13]
+	mov	rdi,[r12+C_IN_BUF]
+	add	rdi,r13
 	call	http_handle
 	test	eax,eax
 	jz	.incomplete
-	js	.wait_out			; needs more output room: after the send
+	cmp	eax,HTTP_LARGE_INPUT
+	je	.large
+	cmp	eax,HTTP_WAIT_OUTPUT
+	je	.wait_out			; after the pending output is sent
 	add	r13d,eax
 	jmp	.next
+.large:
+	; The request is larger than the slot's buffer: move it to the front,
+	; then to a large buffer, and read the rest there.
+	call	.shift
+	call	conn_large_input
+	jnc	.next
+	or	dword [r12+C_FLAGS],F_CLOSE_AFTER
+	call	respond_busy
+	jmp	.discard
 .incomplete:
 	test	r13d,r13d
 	jnz	.compact
-	cmp	dword [r12+C_IN_LEN],IN_CAP
+	mov	eax,[r12+C_IN_CAP]
+	cmp	[r12+C_IN_LEN],eax
 	jb	.compact
 	; A full buffer without a complete header block.
 	or	dword [r12+C_FLAGS],F_CLOSE_AFTER
@@ -433,15 +593,28 @@ process_input:
 .wait_out:
 	or	dword [r12+C_FLAGS],F_WAIT_OUT
 .compact:
+	call	.shift
+	; All input consumed and nothing being read: a large input buffer is
+	; no longer needed.
+	cmp	dword [r12+C_IN_LEN],0
+	jne	.done
+	test	dword [r12+C_FLAGS],F_RECV
+	jnz	.done
+	call	conn_inline_input
+.done:
+	pop	r13
+	ret
+
+; Drop the r13d consumed bytes from the front of the input.
+.shift:
 	test	r13d,r13d
-	jz	.done
+	jz	.shifted
 	mov	ecx,[r12+C_IN_LEN]
 	sub	ecx,r13d
 	mov	[r12+C_IN_LEN],ecx
-	jz	.done
-	lea	rsi,[r12+IN_OFF+r13]
-	lea	rdi,[r12+IN_OFF]
+	mov	rdi,[r12+C_IN_BUF]
+	lea	rsi,[rdi+r13]
+	xor	r13d,r13d
 	rep	movsb
-.done:
-	pop	r13
+.shifted:
 	ret

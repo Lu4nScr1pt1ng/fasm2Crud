@@ -71,6 +71,10 @@ CASES = [
     ("bare LF", b"GET /healthz HTTP/1.1\nHost: t\n\n", [400]),
     ("space before colon", b"GET /healthz HTTP/1.1\r\nHost : t\r\n\r\n", [400]),
     ("control byte in value", b"GET /healthz HTTP/1.1\r\nHost: t\x01\r\n\r\n", [400]),
+    # Fields after a Connection header still count.
+    ("host after connection", b"GET /healthz HTTP/1.1\r\nConnection: keep-alive\r\n" + H + CLOSE + b"\r\n", [200]),
+    ("content-length after connection", b"POST /healthz HTTP/1.1\r\n" + H + b"Connection: keep-alive\r\nContent-Length: 17\r\n\r\n"
+     + b"GET /x HTTP/1.1\r\n" + b"GET /healthz HTTP/1.1\r\n" + H + CLOSE + b"\r\n", [405, 200]),
     ("transfer-encoding", b"POST /healthz HTTP/1.1\r\n" + H
      + b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n", [501]),
     ("duplicate content-length", b"POST /healthz HTTP/1.1\r\n" + H

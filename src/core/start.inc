@@ -21,6 +21,8 @@ cstring env_db_name, 'API_DB_NAME='
 cstring env_db_password, 'API_DB_PASSWORD='
 cstring env_db_conns, 'API_DB_CONNS='
 cstring env_token_key, 'API_TOKEN_KEY='
+cstring env_large_buffers, 'API_LARGE_BUFFERS='
+cstring env_trim_idle, 'API_TRIM_IDLE='
 cstring default_db_user, 'api'
 cstring default_db_name, 'fasm2crud'
 
@@ -62,6 +64,10 @@ start:
 ;   API_DB_NAME    (default fasm2crud)
 ;   API_DB_PASSWORD  required with API_DB_HOST
 ;   API_DB_CONNS   connections per worker (default 2)
+;   API_LARGE_BUFFERS  128 KiB buffers per worker for large requests and
+;                  responses (default 64); address space only until used
+;   API_TRIM_IDLE  seconds before idle memory goes back to the kernel
+;                  (default 30)
 ;   API_TOKEN_KEY  base64url of the 32-byte access token key; when unset or
 ;                  empty a random key is made at startup (tokens die with
 ;                  the process)
@@ -124,6 +130,20 @@ config_load:
 	mov	r8d,1000000
 	call	env_uint
 	mov	[g_busy_poll_us],eax
+	lea	rdi,[env_large_buffers]
+	mov	esi,env_large_buffers.len
+	mov	edx,DEFAULT_LARGE_BUFFERS
+	mov	ecx,1
+	mov	r8d,4096
+	call	env_uint
+	mov	[g_large_count],eax
+	lea	rdi,[env_trim_idle]
+	mov	esi,env_trim_idle.len
+	mov	edx,DEFAULT_TRIM_IDLE
+	mov	ecx,1
+	mov	r8d,86400
+	call	env_uint
+	mov	[g_trim_idle],eax
 	call	config_token_key
 	jmp	config_db
 

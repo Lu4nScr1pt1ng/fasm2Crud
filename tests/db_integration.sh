@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 # Integration checks against the compose PostgreSQL (make up first):
 # SCRAM login and a pipelined round trip, a wrong password failing fast,
-# the account and notes endpoints, and recovery after the database restarts.
+# the account and notes endpoints, memory that comes back, and recovery after the database restarts.
 set -eu
 cd "$(dirname "$0")/.."
 
@@ -23,13 +23,20 @@ API_TOKEN_KEY="$KEY" API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PAS
 good=$!
 API_PORT=18091 API_WORKERS=1 API_DB_HOST="$HOST" API_DB_PASSWORD=wrong ./build/fasm2crud 2>/dev/null &
 bad=$!
-trap 'kill $good $bad 2>/dev/null || true' EXIT
+trap 'kill $good $bad ${mem:-} 2>/dev/null || true' EXIT
 
 wait_ready 18090 || true
 check "readyz through SCRAM and the query pipeline" 200 "$(code 18090)"
 check "wrong password answers 503" 503 "$(code 18091)"
 python3 -I tests/auth_api.py 18090 "$KEY" || status=1
 python3 -I tests/notes_api.py 18090 || status=1
+
+# Memory follows the load and goes back; the large buffer pool is bounded.
+API_PORT=18092 API_WORKERS=1 API_TRIM_IDLE=2 API_LARGE_BUFFERS=4 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+mem=$!
+wait_ready 18092 || true
+python3 -I tests/memory_api.py 18092 || status=1
+kill $mem 2>/dev/null || true
 
 docker compose restart postgres >/dev/null 2>&1
 if wait_ready 18090; then r=200; else r="$(code 18090)"; fi

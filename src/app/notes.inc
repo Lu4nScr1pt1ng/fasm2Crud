@@ -15,23 +15,34 @@
 ; stale, so concurrent writers never lose each other's updates; the check
 ; and the write are one statement. Notes of other users are 404.
 ;
-; Sizes: title 1..200 bytes and body up to 3000 bytes of UTF-8, with no
-; control characters but tab, LF and CR. Escaped, a whole note response
-; then fits in NOTE_RESP_MAX, and a notes request waits until the output
-; buffer has that much room (route_output_need). Pages are keyset, newest
-; first: "cursor" is the last id seen, "limit" 1..50 (default 20). A page
-; may hold fewer than "limit" items when the output buffer is full;
-; next_cursor is null only at the end.
+; Limits are the schema's: a title of 1..200 characters and a body of up
+; to 4000, any Unicode text (control characters are escaped on output).
+; Requests up to LARGE_CAP and responses of any size these limits allow
+; are handled through large buffers (src/core/conn.inc); every response is
+; measured exactly, then written once, in place. Pages are keyset, newest
+; first: "cursor" is the last id seen, "limit" 1..50 (default 20), and a
+; page always holds min(limit, what is left); next_cursor is null at the
+; end.
 
-NOTE_TITLE_MAX	= 200
-NOTE_BODY_MAX	= 3000
+NOTE_TITLE_CHARS = 200
+NOTE_BODY_CHARS	= 4000
 NOTES_LIMIT	= 20
 NOTES_LIMIT_MAX	= 50
-NOTE_RESP_MAX	= 7168		; headers + the largest escaped note
-NOTE_HDR_ROOM	= 384		; status line, headers, ETag, Location
-NOTE_OUT_CAP	= NOTE_RESP_MAX - NOTE_HDR_ROOM
-SUMMARY_MAX	= 576		; largest escaped summary
-LIST_TAIL	= 64		; '],"next_cursor":"<id>"}'
+
+; Worst cases, checked against the buffers at assembly time. A character
+; is at most 4 bytes of UTF-8, 6 bytes escaped in a response (\u001f) and
+; 12 in a request (a surrogate pair, "\ud83d\ude00").
+NOTE_REQUEST_MAX = IN_CAP + 64 + (NOTE_TITLE_CHARS + NOTE_BODY_CHARS) * 12
+NOTE_JSON_MAX	= 160 + 36 + 10 + 2 * 27 + (NOTE_TITLE_CHARS + NOTE_BODY_CHARS) * 6
+SUMMARY_JSON_MAX = 80 + 36 + 10 + 27 + NOTE_TITLE_CHARS * 6
+PAGE_JSON_MAX	= 64 + NOTES_LIMIT_MAX * (SUMMARY_JSON_MAX + 1)
+; One DataRow per column set: 7 bytes, 4 per column, the values.
+PAGE_REPLY_MAX	= 128 + (NOTES_LIMIT_MAX + 1) * (7 + 4 * 4 + 36 + NOTE_TITLE_CHARS * 4 + 10 + 27)
+assert NOTE_REQUEST_MAX <= LARGE_CAP
+assert NOTE_JSON_MAX + RESP_HEAD_ROOM <= LARGE_CAP
+assert PAGE_JSON_MAX + RESP_HEAD_ROOM <= LARGE_CAP
+assert PAGE_REPLY_MAX < PG_RX_CAP
+assert NOTE_TITLE_CHARS * 4 + NOTE_BODY_CHARS * 4 <= AUTH_SCRATCH
 
 cstring name_title, 'title'
 cstring name_body, 'body'
@@ -43,9 +54,9 @@ rodata
 	align 8
 	spec_note:
 		dq name_title
-		dd name_title.len, NOTE_TITLE_MAX
+		dd name_title.len, NOTE_TITLE_CHARS * 4
 		dq name_body
-		dd name_body.len, NOTE_BODY_MAX
+		dd name_body.len, NOTE_BODY_CHARS * 4
 end rodata
 
 bss
@@ -60,8 +71,29 @@ bss
 	g_note_has_cursor dd ?
 	g_note_num:	rb 12
 	g_note_hdr:	rb 128
-	g_note_out:	rb NOTE_OUT_CAP
 end bss
+
+; The fixed parts of the JSON, named so their lengths add up at assembly
+; time.
+cstring nj_id, '{"id":"'
+cstring nj_title, '","title":"'
+cstring nj_body, '","body":"'
+cstring nj_version, '","version":'
+cstring nj_created, ',"created_at":"'
+cstring nj_updated, '","updated_at":"'
+cstring nj_sum_updated, ',"updated_at":"'
+cstring nj_end, '"}'
+cstring nj_items, '{"items":['
+cstring nj_cursor, '],"next_cursor":"'
+cstring nj_no_cursor, '],"next_cursor":null}'
+NOTE_FIXED = nj_id.len + nj_title.len + nj_body.len + nj_version.len + nj_created.len + nj_updated.len + nj_end.len
+SUMMARY_FIXED = nj_id.len + nj_title.len + nj_version.len + nj_sum_updated.len + nj_end.len
+
+macro put_str name*
+	lea	rsi,[name]
+	mov	ecx,name.len
+	rep	movsb
+end macro
 
 ; g_note_params[index] = ptr, len (clobbers rax).
 macro note_param index*, ptr*, len*
@@ -182,30 +214,23 @@ note_if_match:
 	mov	eax,ST_412
 	ret
 
-; rsi = text, edx = length: CF when it holds a control character other
-; than tab, LF and CR (the JSON decoder already refused bad UTF-8 and NUL).
-note_text_ok:
+; rsi = UTF-8 text (valid: the JSON decoder checked it), edx = length.
+; eax = characters, as PostgreSQL's length() counts them.
+utf8_chars:
+	xor	eax,eax
 	test	edx,edx
-	jz	.ok
+	jz	.done
 .byte:
-	movzx	eax,byte [rsi]
+	movzx	ecx,byte [rsi]
 	inc	rsi
-	cmp	al,0x20
-	jae	.next
-	cmp	al,9
-	je	.next
-	cmp	al,10
-	je	.next
-	cmp	al,13
-	jne	.bad
-.next:
+	and	ecx,0xC0
+	cmp	ecx,0x80			; continuation bytes do not count
+	je	@f
+	inc	eax
+@@:
 	dec	edx
 	jnz	.byte
-.ok:
-	clc
-	ret
-.bad:
-	stc
+.done:
 	ret
 
 ; Parse and check a note body (spec_note). esi = 1 when the title is
@@ -232,19 +257,21 @@ note_body:
 	jnz	.invalid
 	jmp	.body
 .title:
-	mov	edx,[g_auth_vals+JV_LEN]
-	test	edx,edx
-	jz	.invalid
 	mov	rsi,[g_auth_vals+JV_PTR]
-	call	note_text_ok
-	jc	.invalid
+	mov	edx,[g_auth_vals+JV_LEN]
+	call	utf8_chars
+	test	eax,eax
+	jz	.invalid
+	cmp	eax,NOTE_TITLE_CHARS
+	ja	.invalid
 .body:
 	cmp	dword [g_auth_vals+JV_SIZE+JV_PRESENT],0
 	je	.ok
 	mov	rsi,[g_auth_vals+JV_SIZE+JV_PTR]
 	mov	edx,[g_auth_vals+JV_SIZE+JV_LEN]
-	call	note_text_ok
-	jc	.invalid
+	call	utf8_chars
+	cmp	eax,NOTE_BODY_CHARS
+	ja	.invalid
 .ok:
 	xor	eax,eax
 .done:
@@ -516,8 +543,7 @@ notes_query:
 ; ---------------------------------------------------------------- replies
 
 ; Write a JSON string body (no quotes): rdi = destination, rsi = UTF-8
-; text, edx = length. rdi is advanced. At most 2 bytes per input byte for
-; the text notes accept (6 for other control characters).
+; text, edx = length. rdi is advanced; json_string_len says by how much.
 json_write_string:
 	test	edx,edx
 	jz	.done
@@ -568,8 +594,37 @@ json_write_string:
 .done:
 	ret
 
-; Copy column ecx of the DataRow at r13 to rdi, raw or as JSON string
-; text. Nothing is written for NULL.
+; Escaped length of rsi/edx, exactly as json_write_string writes it.
+json_string_len:
+	mov	eax,edx
+	test	edx,edx
+	jz	.done
+.byte:
+	movzx	ecx,byte [rsi]
+	inc	rsi
+	cmp	cl,'"'
+	je	.two
+	cmp	cl,'\'
+	je	.two
+	cmp	cl,0x20
+	jae	.next
+	cmp	cl,10
+	je	.two
+	cmp	cl,13
+	je	.two
+	cmp	cl,9
+	je	.two
+	add	eax,4				; \u00XX
+.two:
+	inc	eax
+.next:
+	dec	edx
+	jnz	.byte
+.done:
+	ret
+
+; Column ecx of the DataRow at r13: copy it to rdi, raw or as JSON string
+; text (nothing for NULL); or add its raw or escaped length to r14d.
 note_col_raw:
 	push	rdi
 	mov	rsi,r13
@@ -593,51 +648,90 @@ note_col_text:
 .done:
 	ret
 
-; rdi = destination, rsi = DataRow (id, title, body, version, created_at,
-; updated_at). rdi is advanced past the object.
-write_note:
-	push	r13
-	mov	r13,rsi
-	put_lit '{"id":"'
-	xor	ecx,ecx
-	call	note_col_raw
-	put_lit '","title":"'
-	mov	ecx,1
-	call	note_col_text
-	put_lit '","body":"'
-	mov	ecx,2
-	call	note_col_text
-	put_lit '","version":'
-	mov	ecx,3
-	call	note_col_raw
-	put_lit ',"created_at":"'
-	mov	ecx,4
-	call	note_col_raw
-	put_lit '","updated_at":"'
-	mov	ecx,5
-	call	note_col_raw
-	put_lit '"}'
-	pop	r13
+note_len_raw:
+	mov	rsi,r13
+	call	pg_field
+	jc	.done
+	add	r14d,edx
+.done:
 	ret
 
-; rdi = destination, rsi = DataRow (id, title, version, updated_at).
-write_summary:
-	push	r13
-	mov	r13,rsi
-	put_lit '{"id":"'
+note_len_text:
+	mov	rsi,r13
+	call	pg_field
+	jc	.done
+	mov	rsi,rax
+	call	json_string_len
+	add	r14d,eax
+.done:
+	ret
+
+; Lengths of the JSON objects below. r13 = DataRow; r14d += length.
+note_measure:
+	add	r14d,NOTE_FIXED
+	xor	ecx,ecx
+	call	note_len_raw
+	mov	ecx,1
+	call	note_len_text
+	mov	ecx,2
+	call	note_len_text
+	mov	ecx,3
+	call	note_len_raw
+	mov	ecx,4
+	call	note_len_raw
+	mov	ecx,5
+	jmp	note_len_raw
+
+summary_measure:
+	add	r14d,SUMMARY_FIXED
+	xor	ecx,ecx
+	call	note_len_raw
+	mov	ecx,1
+	call	note_len_text
+	mov	ecx,2
+	call	note_len_raw
+	mov	ecx,3
+	jmp	note_len_raw
+
+; rdi = destination, r13 = DataRow (id, title, body, version, created_at,
+; updated_at). rdi is advanced past the object.
+write_note:
+	put_str nj_id
 	xor	ecx,ecx
 	call	note_col_raw
-	put_lit '","title":"'
+	put_str nj_title
 	mov	ecx,1
 	call	note_col_text
-	put_lit '","version":'
+	put_str nj_body
 	mov	ecx,2
-	call	note_col_raw
-	put_lit ',"updated_at":"'
+	call	note_col_text
+	put_str nj_version
 	mov	ecx,3
 	call	note_col_raw
-	put_lit '"}'
-	pop	r13
+	put_str nj_created
+	mov	ecx,4
+	call	note_col_raw
+	put_str nj_updated
+	mov	ecx,5
+	call	note_col_raw
+	put_str nj_end
+	ret
+
+; rdi = destination, r13 = DataRow (id, title, version, updated_at).
+write_summary:
+	put_str nj_id
+	xor	ecx,ecx
+	call	note_col_raw
+	put_str nj_title
+	mov	ecx,1
+	call	note_col_text
+	put_str nj_version
+	mov	ecx,2
+	call	note_col_raw
+	put_str nj_sum_updated
+	mov	ecx,3
+	call	note_col_raw
+	put_str nj_end
 	ret
 
 ; 'ETag: "<version>"' into g_note_hdr from rsi (text), edx = length.
@@ -657,17 +751,22 @@ note_etag:
 respond_note:
 	push	r13
 	push	r14
-	mov	r14d,edi
+	push	r15
+	mov	r15d,edi
 	mov	r13,rsi
-	lea	rdi,[g_note_out]
+	xor	r14d,r14d
+	call	note_measure
+	mov	edx,r14d
+	call	respond_reserve
+	jc	.done
+	mov	rdi,rax
 	call	write_note
-	push	rdi
 	mov	rsi,r13
 	mov	ecx,3
 	call	pg_field
 	mov	rsi,rax
 	call	note_etag
-	cmp	r14d,ST_201
+	cmp	r15d,ST_201
 	jne	@f
 	put_lit 'Location: /v1/notes/'
 	xor	ecx,ecx
@@ -677,13 +776,14 @@ respond_note:
 	mov	r8,rdi
 	lea	rcx,[g_note_hdr]
 	sub	r8,rcx
-	pop	rdx
-	lea	rsi,[g_note_out]
-	sub	rdx,rsi
-	mov	edi,r14d
+	mov	edi,r15d
+	mov	edx,r14d
+	call	respond_built
+.done:
+	pop	r15
 	pop	r14
 	pop	r13
-	jmp	respond
+	ret
 
 ; 412 with the current ETag: rax = version text, edx = length.
 respond_stale:
@@ -787,7 +887,10 @@ cont_note_deleted:
 	mov	edi,ST_500
 	jmp	respond_status
 
-; Up to limit + 1 summary rows; the page size is in C_AUX.
+; Up to limit + 1 summary rows; the page size is in C_AUX. The page holds
+; the first min(limit, rows); a row past the limit means more follow, and
+; next_cursor is then the last id in the page. Measured, then written.
+; [rsp] = last row of the page, [rsp+8] = more follow, [rsp+12] = written.
 cont_notes_page:
 	cmp	eax,PGR_OK
 	jne	respond_query_failed
@@ -796,56 +899,81 @@ cont_notes_page:
 	push	r13
 	push	r14
 	push	r15
-	mov	r13,rsi				; next message
-	mov	r14,rdx				; end
-	mov	ebp,[r12+C_AUX]
-	xor	r15d,r15d			; items written
-	xor	ebx,ebx				; last row written
-	lea	rdi,[g_note_out]
-	put_lit '{"items":['
-.row:
-	mov	rsi,r13
-	mov	rdx,r14
+	sub	rsp,24
+	mov	rbx,rsi				; first message
+	mov	r15,rdx				; end
+	mov	qword [rsp],0
+	mov	dword [rsp+8],0
+	xor	ebp,ebp				; items in the page
+	mov	r14d,nj_items.len + nj_no_cursor.len
+	mov	rsi,rbx
+.measure:
+	mov	rdx,r15
 	call	pg_find_row
-	jc	.end
-	cmp	r15d,ebp
-	jae	.more				; a row past the page: more follow
-	lea	rax,[g_note_out + NOTE_OUT_CAP - SUMMARY_MAX - LIST_TAIL]
-	cmp	rdi,rax
-	ja	.more				; no room for another: stop here
-	test	r15d,r15d
+	jc	.measured
+	cmp	ebp,[r12+C_AUX]
+	jae	.more
+	mov	r13,rsi
+	mov	[rsp],rsi
+	call	summary_measure
+	inc	ebp
+	mov	rsi,r13
+	call	pg_skip_message
+	jmp	.measure
+.more:
+	mov	dword [rsp+8],1
+	add	r14d,nj_cursor.len + 36 + nj_end.len - nj_no_cursor.len
+.measured:
+	test	ebp,ebp
+	jz	@f
+	lea	r14d,[r14+rbp-1]		; commas
+@@:
+	mov	edx,r14d
+	call	respond_reserve
+	jc	.done
+	mov	rdi,rax
+	put_str nj_items
+	mov	dword [rsp+12],0
+	mov	rsi,rbx
+.write:
+	mov	eax,[rsp+12]
+	cmp	eax,ebp
+	jae	.tail
+	test	eax,eax
 	jz	@f
 	mov	byte [rdi],','
 	inc	rdi
 @@:
-	mov	rbx,rsi
-	call	write_summary
-	inc	r15d
-	mov	rsi,rbx
-	call	pg_skip_message
+	mov	rdx,r15
+	call	pg_find_row
 	mov	r13,rsi
-	jmp	.row
-.more:
-	test	rbx,rbx
-	jz	.end
-	put_lit '],"next_cursor":"'
-	mov	r13,rbx
+	call	write_summary
+	inc	dword [rsp+12]
+	mov	rsi,r13
+	call	pg_skip_message
+	jmp	.write
+.tail:
+	cmp	dword [rsp+8],0
+	je	.null
+	put_str nj_cursor
+	mov	r13,[rsp]
 	xor	ecx,ecx
 	call	note_col_raw
-	put_lit '"}'
+	put_str nj_end
 	jmp	.send
-.end:
-	put_lit '],"next_cursor":null}'
+.null:
+	put_str nj_no_cursor
 .send:
-	lea	rsi,[g_note_out]
-	mov	rdx,rdi
-	sub	rdx,rsi
+	mov	edi,ST_200
+	mov	edx,r14d
+	xor	ecx,ecx
+	xor	r8d,r8d
+	call	respond_built
+.done:
+	add	rsp,24
 	pop	r15
 	pop	r14
 	pop	r13
 	pop	rbp
 	pop	rbx
-	mov	edi,ST_200
-	xor	ecx,ecx
-	xor	r8d,r8d
-	jmp	respond
+	ret

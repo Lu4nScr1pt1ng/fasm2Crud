@@ -22,7 +22,7 @@
 HCONT_REGISTER	= 0
 HCONT_LOGIN	= 1
 
-AUTH_SCRATCH	= 4096		; decoded JSON members (notes use it too)
+AUTH_SCRATCH	= 17408		; decoded JSON members (a note's: 800 + 16000 bytes)
 
 cstring name_email, 'email'
 cstring name_password, 'password'

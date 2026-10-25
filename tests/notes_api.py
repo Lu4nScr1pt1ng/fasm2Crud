@@ -22,8 +22,8 @@ def check(name, expected, got):
         failed += 1
 
 
-def request(method, path, body=None, token=None, headers=(), ctype="application/json"):
-    raw = b"" if body is None else body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=False).encode()
+def request(method, path, body=None, token=None, headers=(), ctype="application/json", ascii=False):
+    raw = b"" if body is None else body if isinstance(body, bytes) else json.dumps(body, ensure_ascii=ascii).encode()
     head = f"{method} {path} HTTP/1.1\r\nHost: t\r\n"
     if body is not None:
         head += f"Content-Type: {ctype}\r\n"
@@ -60,10 +60,10 @@ def read_responses(s, count):
     return out
 
 
-def call(method, path, body=None, token=None, headers=(), ctype="application/json"):
+def call(method, path, body=None, token=None, headers=(), ctype="application/json", ascii=False):
     s = socket.create_connection(("127.0.0.1", PORT))
     s.settimeout(5)
-    s.sendall(request(method, path, body, token, headers, ctype))
+    s.sendall(request(method, path, body, token, headers, ctype, ascii))
     r = read_responses(s, 1)
     s.close()
     return r[0] if r else (0, {}, None)
@@ -86,9 +86,9 @@ check("tampered token", 401, call("GET", "/v1/notes", token=alice[:-2] + ("A" if
 # Validation.
 check("create without title", 422, call("POST", "/v1/notes", {"body": "x"}, alice)[0])
 check("create with empty title", 422, call("POST", "/v1/notes", {"title": ""}, alice)[0])
-check("title of 201 bytes", 422, call("POST", "/v1/notes", {"title": "t" * 201}, alice)[0])
-check("body of 3001 bytes", 422, call("POST", "/v1/notes", {"title": "t", "body": "b" * 3001}, alice)[0])
-check("control character", 422, call("POST", "/v1/notes", {"title": "a\u0001b"}, alice)[0])
+check("title of 201 characters", 422, call("POST", "/v1/notes", {"title": "t" * 201}, alice)[0])
+check("title of 201 emoji", 422, call("POST", "/v1/notes", {"title": "😀" * 201}, alice)[0])
+check("body of 4001 characters", 422, call("POST", "/v1/notes", {"title": "t", "body": "é" * 4001}, alice)[0])
 check("unknown member", 422, call("POST", "/v1/notes", {"title": "t", "tags": "x"}, alice)[0])
 check("wrong content type", 415, call("POST", "/v1/notes", {"title": "t"}, alice, ctype="text/plain")[0])
 check("malformed JSON", 400, call("POST", "/v1/notes", b'{"title":', alice)[0])
@@ -96,30 +96,41 @@ check("PUT on the collection", (405, "GET, POST"), (lambda r: (r[0], r[1].get("a
 check("PUT on a note", 405, call("PUT", "/v1/notes/" + "0" * 8 + "-0000-0000-0000-" + "0" * 12, {"title": "t"}, alice)[0])
 check("malformed id", 404, call("GET", "/v1/notes/not-a-uuid-at-all-not-a-uuid-at-all-xx", token=alice)[0])
 
-# Create and read back, with the largest note and characters that need escaping.
-title = '"\\' * 100
-body = 'é"\n\t\r\\😀'[:7] * 300
-body = body.encode()[:3000].decode(errors="ignore")
+# The schema's limits in characters, whatever their encoding: 200 emoji
+# (800 bytes) and 4000 of them, sent the way json.dumps sends by default
+# (every one escaped as a surrogate pair: a ~50 KB request).
+st, _, big = call("POST", "/v1/notes", {"title": "😀" * 200, "body": "😀" * 4000}, alice, ascii=True)
+check("200 + 4000 emoji, ASCII-escaped request", (201, "😀" * 200, "😀" * 4000),
+      (st, (big or {}).get("title"), (big or {}).get("body")))
+
+# The largest response: every character a control character, escaped as
+# \u00XX (6 bytes each, ~25 KB of JSON).
+title = "".join(chr(1 + i % 31) for i in range(200))
+body = "".join(chr(1 + i % 31) for i in range(4000))
 st, h, note = call("POST", "/v1/notes", {"title": title, "body": body}, alice)
 check("create the largest note", 201, st)
 note = note or {}
 nid = note.get("id", "")
 check("Location", f"/v1/notes/{nid}", h.get("location"))
 check("ETag of a new note", '"1"', h.get("etag"))
-check("round trip of escaped text", (title, body), (note.get("title"), note.get("body")))
+check("control characters round trip", (title, body), (note.get("title"), note.get("body")))
 check("timestamps are RFC 3339 UTC", True, note.get("created_at", "").endswith("Z") and "T" in note.get("created_at", ""))
 st, h, got = call("GET", f"/v1/notes/{nid}", token=alice)
 check("get", (200, '"1"', note), (st, h.get("etag"), got))
+mixed = 'aé"\\😀\n\t\u2028\u007f'
+st, _, m = call("POST", "/v1/notes", {"title": mixed, "body": mixed * 400}, alice)
+check("mixed text round trip", (201, mixed, mixed * 400), (st, (m or {}).get("title"), (m or {}).get("body")))
 
-# Several of the largest responses pipelined on one connection: each must
-# wait for room in the output buffer, none may be cut.
+# Several of the largest responses pipelined on one connection, between
+# small ones: none may be cut or reordered.
 s = socket.create_connection(("127.0.0.1", PORT))
 s.settimeout(5)
-s.sendall(request("GET", f"/v1/notes/{nid}", token=alice) * 6)
-got = read_responses(s, 6)
+s.sendall((request("GET", f"/v1/notes/{nid}", token=alice) + request("GET", "/healthz")) * 6)
+got = read_responses(s, 12)
 s.close()
-check("6 pipelined large responses", [200] * 6, [r[0] for r in got])
-check("pipelined bodies are whole", True, all(r[2] == note for r in got))
+check("12 pipelined responses, 6 of them large", [200] * 12, [r[0] for r in got])
+check("pipelined bodies are whole and in order", True,
+      all(r[2] == note for r in got[0::2]) and all(r[2] == {"status": "ok"} for r in got[1::2]))
 
 # Other users see nothing.
 check("another user's note (GET)", 404, call("GET", f"/v1/notes/{nid}", token=bob)[0])
@@ -154,11 +165,12 @@ check("GET after DELETE", 404, call("GET", f"/v1/notes/{nid}", token=alice)[0])
 check("DELETE twice", 404, call("DELETE", f"/v1/notes/{nid}", token=alice, headers=['If-Match: "3"'])[0])
 
 # Keyset pages, newest first.
-ids = [call("POST", "/v1/notes", {"title": f"n{i}"}, alice)[2]["id"] for i in range(25)]
+dave = account()
+ids = [call("POST", "/v1/notes", {"title": f"n{i}"}, dave)[2]["id"] for i in range(25)]
 seen, sizes, cursor = [], [], None
 while True:
     path = "/v1/notes?limit=10" + (f"&cursor={cursor}" if cursor else "")
-    st, _, page = call("GET", path, token=alice)
+    st, _, page = call("GET", path, token=dave)
     if st != 200:
         break
     sizes.append(len(page["items"]))
@@ -168,27 +180,22 @@ while True:
         break
 check("pages of 10", [10, 10, 5], sizes)
 check("every note once, newest first", list(reversed(ids)), seen)
-check("default page size", 20, len(call("GET", "/v1/notes", token=alice)[2]["items"]))
+check("default page size", 20, len(call("GET", "/v1/notes", token=dave)[2]["items"]))
 check("limit 0", 400, call("GET", "/v1/notes?limit=0", token=alice)[0])
 check("limit 51", 400, call("GET", "/v1/notes?limit=51", token=alice)[0])
 check("unknown parameter", 400, call("GET", "/v1/notes?sort=asc", token=alice)[0])
 check("limit twice", 400, call("GET", "/v1/notes?limit=1&limit=2", token=alice)[0])
 check("malformed cursor", 400, call("GET", "/v1/notes?cursor=abc", token=alice)[0])
 
-# Pages that the output buffer cuts short: 50 notes with the widest titles.
+# The largest page: 50 notes whose titles are 200 control characters
+# (~67 KB of JSON). It comes whole, in one page.
 carol = account()
-wide = [call("POST", "/v1/notes", {"title": '"' * 200}, carol)[2]["id"] for _ in range(50)]
-seen, sizes, cursor = [], [], None
-while True:
-    path = "/v1/notes?limit=50" + (f"&cursor={cursor}" if cursor else "")
-    st, _, page = call("GET", path, token=carol)
-    if st != 200:
-        break
-    sizes.append(len(page["items"]))
-    seen += [n["id"] for n in page["items"]]
-    cursor = page["next_cursor"]
-    if not cursor:
-        break
-check("full pages are cut short, not lost", (True, list(reversed(wide))), (len(sizes) > 1 and max(sizes) < 50, seen))
+wide = [call("POST", "/v1/notes", {"title": title}, carol)[2]["id"] for _ in range(51)]
+st, _, page = call("GET", "/v1/notes?limit=50", token=carol)
+page = page or {"items": []}
+check("the largest page is whole", (200, 50, list(reversed(wide))[:50], wide[0]),
+      (st, len(page["items"]), [n["id"] for n in page["items"]], page.get("next_cursor") and
+       call("GET", f"/v1/notes?limit=50&cursor={page['next_cursor']}", token=carol)[2]["items"][0]["id"]))
+check("its titles round trip", True, all(n["title"] == title for n in page["items"]))
 
 sys.exit(1 if failed else 0)

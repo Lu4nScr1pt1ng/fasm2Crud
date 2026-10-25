@@ -71,22 +71,47 @@ flood.
 
 ## Memory
 
-No `malloc`, no `free`, no growth after startup.
+No `malloc`, no `free`. Every pool is reserved once, at its largest, as
+address space; memory becomes resident as load needs it and goes back to
+the kernel when the load is gone.
 
 * All connection memory is reserved with one `mmap` at startup, with
   `PROT_NONE` guard pages at both ends. A connection slot is 16 KiB:
   a 256-byte header, about 8 KiB of input and 8 KiB of output.
-* Slots come from a LIFO free list. The most recently freed slot, still hot
-  in cache and already faulted in, is reused first, so resident memory
-  follows the number of concurrent connections, not `API_MAX_CONNS`. Idle
-  workers use about 1 MB.
 * Requests are parsed in place. Responses are written in place.
+* **Large buffers.** A request or response that does not fit its slot (a
+  note at the schema's limits, a page of 50) borrows a 128 KiB buffer from
+  a per-worker pool (`API_LARGE_BUFFERS`, default 64) for exactly as long
+  as it needs it: the input buffer until the request is consumed, the
+  output buffer until its bytes are sent. Responses are measured first and
+  written once, straight into the buffer they are sent from. Holding one
+  has a total deadline (10 s for a request, 60 s for a response) on top of
+  the progress timeouts, so slow clients cannot keep the pool; when it is
+  empty the request gets 503 with `Retry-After`.
+* **Pools give memory back** (`src/core/pool.inc`). Slots and large buffers
+  come from LIFO stacks: the most recently released item, still in cache
+  and faulted in, goes out first, so resident memory follows the load.
+  Items that stay at the bottom of the stack, beyond a warm reserve (64
+  slots, 2 large buffers) and unused for `API_TRIM_IDLE` seconds (default
+  30), get `MADV_DONTNEED` on the timer tick, at most 256 per tick. A busy
+  pool never trims, so it never pays page faults for this. Generation
+  counters live apart from the slots, so a trimmed slot loses nothing.
+* The same rule covers the rest: each PostgreSQL connection keeps 64 KiB
+  of its 256 KiB transmit buffer and 16 KiB of its receive buffer warm
+  and returns the rest after a burst; an idle hasher returns its Argon2
+  memory (19 MiB with the default parameters) when the worker asks.
+* Measured with one worker (`tests/memory_api.py`): 0.7 MiB at rest,
+  19.7 MiB with 1500 open connections, 1.6 MiB once idle again; a hasher
+  goes from 20 MiB after a login to 0.6 MiB.
 * Every limit is explicit (see `src/core/config.inc`): request size, header
-  count, response reserve, connection count. When one is reached, the
-  server answers 413, 431 or 503 or applies backpressure. It never
-  allocates more.
+  count, response reserve, connection count, large buffers. When one is
+  reached, the server answers 413, 431 or 503 or applies backpressure.
 * SIMD scans read at most 31 bytes past the data. The connection layout
-  guarantees that memory is mapped.
+  and the large buffers' 64 spare bytes guarantee that memory is mapped.
+* Worst cases are checked at assembly time: the largest note request
+  (every character escaped as a surrogate pair), the largest note and page
+  responses (every character a control character) and the largest page
+  reply from the database all fit their buffers, or the build fails.
 
 ## HTTP
 
@@ -251,21 +276,21 @@ database access. Notes of other users are 404, never 403.
   `cursor` is the last id seen, so a page costs the same however deep it
   is and concurrent inserts never shift it. `limit` is 1..50 (default 20);
   the query asks for one row more to know whether another page follows.
-* **Sizes follow from the memory model.** A response is written in place
-  into the connection's 8 KiB output buffer, so a note must always fit:
-  title 1..200 bytes and body up to 3000 bytes of UTF-8, with no control
-  characters but tab, LF and CR (each escapes to at most two bytes). A
-  notes request waits, unparsed, until the output buffer has room for the
-  largest note (`route_output_need`), so pipelined requests are delayed,
-  never cut. A page of summaries stops early when the buffer is full and
-  sets `next_cursor` there; following the cursors still returns every note
-  exactly once.
+* **Limits are the schema's**, in characters: a title of 1..200 and a
+  body of up to 4000, any Unicode text; control characters are escaped on
+  output. A note at those limits takes a large buffer whichever way the
+  client encodes it (`json.dumps` escapes every emoji as a 12-byte
+  surrogate pair: a 50 KB request), and so does its response. A notes
+  request starts with an empty output buffer, so a response built in
+  place never moves earlier ones; pipelined requests behind it wait for
+  the send, never get cut. A page always holds `min(limit, what is left)`.
 * Times come from the database as RFC 3339 in UTC with microseconds.
 
 Measured (the reference split: API on 4 cores, PostgreSQL on 2, wrk with
 32 connections): `GET /v1/notes/{id}` 73k req/s (p50 0.34 ms), a page of
-20 summaries 48k req/s (p50 0.52 ms), against 385k req/s for `/healthz`
-on the same run. Token checks and JSON cost little next to the query.
+20 summaries 48k req/s (p50 0.52 ms), the largest note (16 KB of emoji,
+through a large buffer) 32k req/s, against 387k req/s for `/healthz` on
+the same run. Token checks and JSON cost little next to the query.
 
 
 

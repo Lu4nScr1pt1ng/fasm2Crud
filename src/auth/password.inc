@@ -12,11 +12,14 @@
 ;     CPU back whenever it has work;
 ;   * keeps only its socket open, cannot be traced or dumped, and installs
 ;     a seccomp filter before the first job: from then on the kernel lets
-;     it read, write and exit, and kills it for any other system call.
+;     it read, write, exit and give its Argon2 memory back (madvise on that
+;     one range), and kills it for any other system call.
 ;     (Strict mode would say the same, but it cannot be entered under a
 ;     filter that is already there, such as Docker's; filters stack.)
 ;   * dies with its worker (PR_SET_PDEATHSIG). If it dies first, its jobs
-;     are answered with 503 and a new hasher starts on the next tick.
+;     are answered with 503 and a new hasher starts on the next tick;
+;   * gives its memory back after API_TRIM_IDLE seconds without a job,
+;     when the worker asks (a job with id 0).
 ;
 ; At most HASH_QUEUE_MAX jobs wait per worker; beyond that, auth requests
 ; get 503 with Retry-After. Logins for unknown addresses hash too, so they
@@ -58,48 +61,50 @@ bss
 	g_hreply:	rb 64
 	align 8
 	g_a2job:	rb ARGON2_SIZE
+	g_hasher_filter: rb HASHER_FILTER_LEN * 8
+	g_hasher_fprog	dq ?, ?
+	g_hasher_last	dd ?		; tick of the last reply
+	g_hasher_dirty	dd ?		; hashed since the last trim
 end bss
 
 rodata
 	align 16
 	pw_dummy_salt	db PW_SALT_LEN dup 0
 	hasher_name	db 'fasm2crud-h',0
-	; struct sock_filter: dw code, db jt, jf, dd k.
-	hasher_filter:
-	dw 0x20
-	db 0, 0
-	dd 4				; ld arch
-	dw 0x15
-	db 1, 0
-	dd AUDIT_ARCH_X86_64		; jeq -> ld nr
-	dw 0x06
-	db 0, 0
-	dd SECCOMP_RET_KILL_PROCESS
-	dw 0x20
-	db 0, 0
-	dd 0				; ld nr
-	dw 0x15
-	db 4, 0
-	dd SYS_read
-	dw 0x15
-	db 3, 0
-	dd SYS_write
-	dw 0x15
-	db 2, 0
-	dd SYS_exit
-	dw 0x15
-	db 1, 0
-	dd SYS_exit_group
-	dw 0x06
-	db 0, 0
-	dd SECCOMP_RET_KILL_PROCESS
-	dw 0x06
-	db 0, 0
-	dd SECCOMP_RET_ALLOW
-	HASHER_FILTER_LEN = ($ - hasher_filter) / 8
-	align 8
-	hasher_fprog	dw HASHER_FILTER_LEN, 0, 0, 0
-			dq hasher_filter
+	; Seccomp filter: read, write and exit; madvise only to give back the
+	; Argon2 memory (address patched in at startup, size and advice fixed);
+	; anything else, or another architecture, kills the process.
+	macro bpf code*, jt*, jf*, k*
+		dw code
+		db jt, jf
+		dd k
+	end macro
+	BPF_LD_ABS	= 0x20
+	BPF_JEQ		= 0x15
+	BPF_RET		= 0x06
+	hasher_filter_tpl:
+	bpf BPF_LD_ABS, 0, 0, 4				; 0: arch
+	bpf BPF_JEQ, 1, 0, AUDIT_ARCH_X86_64
+	bpf BPF_RET, 0, 0, SECCOMP_RET_KILL_PROCESS
+	bpf BPF_LD_ABS, 0, 0, 0				; 3: nr
+	bpf BPF_JEQ, 15, 0, SYS_read
+	bpf BPF_JEQ, 14, 0, SYS_write
+	bpf BPF_JEQ, 13, 0, SYS_exit
+	bpf BPF_JEQ, 12, 0, SYS_exit_group
+	bpf BPF_JEQ, 0, 10, SYS_madvise
+	bpf BPF_LD_ABS, 0, 0, 16			; 9: address, low half
+	bpf BPF_JEQ, 0, 8, 0				; 10: patched
+	bpf BPF_LD_ABS, 0, 0, 20			; high half
+	bpf BPF_JEQ, 0, 6, 0				; 12: patched
+	bpf BPF_LD_ABS, 0, 0, 24			; length
+	bpf BPF_JEQ, 0, 4, PW_MAX_M_KIB * 1024
+	bpf BPF_LD_ABS, 0, 0, 28
+	bpf BPF_JEQ, 0, 2, 0
+	bpf BPF_LD_ABS, 0, 0, 32			; advice
+	bpf BPF_JEQ, 1, 0, MADV_DONTNEED
+	bpf BPF_RET, 0, 0, SECCOMP_RET_KILL_PROCESS	; 19
+	bpf BPF_RET, 0, 0, SECCOMP_RET_ALLOW		; 20
+	HASHER_FILTER_LEN = ($ - hasher_filter_tpl) / 8
 end rodata
 
 ; ---------------------------------------------------------------- worker side
@@ -161,10 +166,12 @@ hasher_arm_recv:
 	mov	[rax+SQE_USER_DATA],rcx
 	ret
 
-; Once per tick: replace a hasher that went away.
+; Once per tick: replace a hasher that went away, and let an idle one give
+; its memory back (up to PW_MAX_M_KIB, 19 MiB with the default
+; parameters): a job with id 0 asks for that.
 hasher_tick:
 	cmp	dword [g_hasher_up],0
-	jne	.done
+	jne	.idle
 	cmp	dword [g_draining],0
 	jne	.done
 	call	hasher_start
@@ -179,6 +186,30 @@ hasher_tick:
 	log_lit ')'
 	call	log_end
 .done:
+	ret
+.idle:
+	cmp	dword [g_hasher_dirty],0
+	je	.done
+	cmp	dword [g_hasher_jobs],0
+	jne	.done
+	mov	eax,[g_tick]
+	sub	eax,[g_hasher_last]
+	cmp	eax,[g_trim_idle]
+	jb	.done
+	lea	rdi,[g_hjob]
+	mov	ecx,HJ_SIZE
+	call	secure_zero			; id 0: trim
+	mov	edi,[g_hasher_fd]
+	lea	rsi,[g_hjob]
+	mov	edx,HJ_SIZE
+	mov	r10d,MSG_DONTWAIT or MSG_NOSIGNAL
+	xor	r8d,r8d
+	xor	r9d,r9d
+	mov	eax,SYS_sendto
+	syscall
+	cmp	rax,HJ_SIZE
+	jne	.done
+	mov	dword [g_hasher_dirty],0
 	ret
 
 ; Queue a hash for the current request.
@@ -236,6 +267,7 @@ hasher_submit:
 	mov	[r15+AC_HCONT],r13d
 	or	dword [r15+AC_FLAGS],ACF_HASHING
 	inc	dword [g_hasher_jobs]
+	mov	dword [g_hasher_dirty],1
 	or	dword [r12+C_FLAGS],F_WAIT_DB
 	xor	eax,eax
 	pop	r15
@@ -320,6 +352,8 @@ hasher_deliver:
 	call	auth_ctx_ptr
 	and	dword [rax+AC_FLAGS],not ACF_HASHING
 	dec	dword [g_hasher_jobs]
+	mov	ecx,[g_tick]
+	mov	[g_hasher_last],ecx
 	mov	ebx,[rax+AC_SLOT]
 	conn_ptr r12,rbx
 	mov	ecx,[rax+AC_GEN]
@@ -423,9 +457,21 @@ hasher_main:
 	syscall
 	test	eax,eax
 	js	.no_filter
+	; The filter, with the address of the memory it may give back.
+	lea	rsi,[hasher_filter_tpl]
+	lea	rdi,[g_hasher_filter]
+	mov	ecx,HASHER_FILTER_LEN * 8
+	rep	movsb
+	mov	rax,[g_pw_mem]
+	mov	[g_hasher_filter+10*8+4],eax
+	shr	rax,32
+	mov	[g_hasher_filter+12*8+4],eax
+	mov	word [g_hasher_fprog],HASHER_FILTER_LEN
+	lea	rax,[g_hasher_filter]
+	mov	[g_hasher_fprog+8],rax
 	mov	edi,PR_SET_SECCOMP
 	mov	esi,SECCOMP_MODE_FILTER
-	lea	rdx,[hasher_fprog]
+	lea	rdx,[g_hasher_fprog]
 	mov	eax,SYS_prctl
 	syscall
 	test	eax,eax
@@ -441,6 +487,8 @@ hasher_main:
 	je	.serve
 	cmp	rax,HJ_SIZE
 	jne	.exit				; EOF (the worker is gone) or garbage
+	cmp	dword [g_hjob+HJ_ID],0
+	je	.trim
 	call	hasher_job
 	mov	edi,3
 	lea	rsi,[g_hreply]
@@ -457,6 +505,14 @@ hasher_main:
 	pop	rax
 	cmp	rax,HR_SIZE
 	je	.serve
+.trim:
+	; The worker saw us idle: give the Argon2 memory back. No reply.
+	mov	rdi,[g_pw_mem]
+	mov	esi,PW_MAX_M_KIB * 1024
+	mov	edx,MADV_DONTNEED
+	mov	eax,SYS_madvise
+	syscall
+	jmp	.serve
 .exit:
 	; exit is enough for a single-threaded process, and the filter allows it.
 	xor	edi,edi

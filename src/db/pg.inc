@@ -15,8 +15,10 @@
 
 PG_MAX_CONNS		= 8
 PG_MAX_INFLIGHT		= 128		; power of two
-PG_TX_CAP		= 65536
+PG_TX_CAP		= 262144		; room for a burst of large queries
 PG_RX_CAP		= 65536
+PG_TX_WARM		= 65536		; kept resident; the rest goes back when idle
+PG_RX_WARM		= 16384
 PG_HANDSHAKE_TIMEOUT	= 5		; ticks
 PG_QUERY_TIMEOUT	= 15		; ticks without any reply while queries wait
 PG_BACKOFF_MIN		= 100		; ms
@@ -56,6 +58,9 @@ PG_SQLSTATE	= 52		; 5 characters
 PG_ADDR		= 64		; sockaddr_in
 PG_TS		= 80		; backoff timespec
 PG_FIRST_LEN	= 96
+PG_TX_PEAK	= 100		; tick tx last went past PG_TX_WARM
+PG_RX_PEAK	= 104
+PG_GREW		= 108		; 1: tx went past its warm size, 2: rx did
 PG_SCRAM	= 128		; SC_SIZE
 PG_NONCE	= 208		; 24 base64 characters
 PG_FIRST	= 240		; client-first-message-bare
@@ -405,6 +410,11 @@ pg_commit_tx:
 	lea	rax,[r13+PG_TX]
 	sub	rdi,rax
 	mov	[r13+PG_TX_LEN],edi
+	cmp	edi,PG_TX_WARM
+	jbe	pg_flush
+	mov	eax,[g_tick]
+	mov	[r13+PG_TX_PEAK],eax
+	or	dword [r13+PG_GREW],1
 
 pg_flush:
 	mov	eax,[r13+PG_TX_LEN]
@@ -492,6 +502,11 @@ on_pg_recv:
 	add	[r13+PG_RX_LEN],r14d
 	mov	eax,[g_tick]
 	mov	[r13+PG_SINCE],eax
+	cmp	dword [r13+PG_RX_LEN],PG_RX_WARM
+	jbe	@f
+	mov	[r13+PG_RX_PEAK],eax
+	or	dword [r13+PG_GREW],2
+@@:
 	call	pg_process
 	cmp	dword [r13+PG_STATE],PGS_BROKEN
 	je	.done
@@ -1259,6 +1274,7 @@ pg_tick:
 	cmp	ebx,[g_pg_count]
 	jae	.finished
 	pg_ptr	r13,ebx
+	call	pg_trim
 	mov	r14d,1				; no errno to report
 	mov	eax,[g_tick]
 	sub	eax,[r13+PG_SINCE]
@@ -1291,6 +1307,43 @@ pg_tick:
 	pop	r14
 	pop	r13
 	pop	rbx
+.done:
+	ret
+
+; Buffers that grew past their warm size give the rest back once they
+; have stayed below it for g_trim_idle seconds. Only memory past the data
+; is released: a send covers [PG_TX_SENT, PG_TX_LEN) and a receive writes
+; past PG_RX_LEN, where pages simply fault in again. r13 = connection.
+pg_trim:
+	test	dword [r13+PG_GREW],1
+	jz	.rx
+	cmp	dword [r13+PG_TX_LEN],PG_TX_WARM
+	ja	.rx
+	mov	eax,[g_tick]
+	sub	eax,[r13+PG_TX_PEAK]
+	cmp	eax,[g_trim_idle]
+	jb	.rx
+	lea	rdi,[r13+PG_TX+PG_TX_WARM]
+	mov	esi,PG_TX_CAP - PG_TX_WARM
+	mov	edx,MADV_DONTNEED
+	mov	eax,SYS_madvise
+	syscall
+	and	dword [r13+PG_GREW],not 1
+.rx:
+	test	dword [r13+PG_GREW],2
+	jz	.done
+	cmp	dword [r13+PG_RX_LEN],PG_RX_WARM
+	ja	.done
+	mov	eax,[g_tick]
+	sub	eax,[r13+PG_RX_PEAK]
+	cmp	eax,[g_trim_idle]
+	jb	.done
+	lea	rdi,[r13+PG_RX+PG_RX_WARM]
+	mov	esi,PG_RX_CAP - PG_RX_WARM
+	mov	edx,MADV_DONTNEED
+	mov	eax,SYS_madvise
+	syscall
+	and	dword [r13+PG_GREW],not 2
 .done:
 	ret
 

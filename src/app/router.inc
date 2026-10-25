@@ -97,9 +97,8 @@ route:
 	mov	edi,ST_501
 	jmp	respond_status
 
-; eax = output bytes the current request's response may need (more than
-; RESP_RESERVE only for routes with large responses).
-route_output_need:
+; Routes with large bodies (notes). ZF clear (and eax = 1) for them.
+route_is_notes:
 	xor	eax,eax
 	cmp	dword [req_path_len],9
 	jb	.done
@@ -109,7 +108,23 @@ route_output_need:
 	jne	.done
 	cmp	byte [rdx+8],'s'
 	jne	.done
-	mov	eax,NOTE_RESP_MAX
+	inc	eax
+.done:
+	test	eax,eax
+	ret
+
+; eax = 1 when the route builds its responses in place (respond_built),
+; which needs an empty output buffer to start from.
+route_output_need:
+	jmp	route_is_notes
+
+; eax = the largest request the route accepts: notes take large buffers,
+; everything else fits the slot.
+route_input_max:
+	call	route_is_notes
+	mov	eax,IN_CAP
+	jz	.done
+	mov	eax,LARGE_CAP
 .done:
 	ret
 
