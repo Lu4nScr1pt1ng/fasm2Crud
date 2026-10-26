@@ -41,6 +41,31 @@ services:
     stop_grace_period: 15s
     restart: unless-stopped
     depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Applies docker/postgres/migrations as the database owner, then exits;
+  # the API (which can only read and write rows) starts after it.
+  migrate:
+    image: postgres:18.1-alpine@sha256:b40d931bd0e7ce6eecc59a5a6ac3b3c04a01e559750e73e7086b6dbd7f8bf545
+    entrypoint: ["sh", "/work/scripts/migrate.sh"]
+    environment:
+      PGHOST: "10.231.0.10"
+      PGUSER: "${POSTGRES_USER:-fasm2crud}"
+      PGPASSWORD: "${POSTGRES_PASSWORD:-change-me}"
+      PGDATABASE: "${POSTGRES_DB:-fasm2crud}"
+      MIGRATIONS: "/work/docker/postgres/migrations"
+    volumes:
+      - ./scripts:/work/scripts:ro
+      - ./docker/postgres/migrations:/work/docker/postgres/migrations:ro
+    networks: [backend]
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    read_only: true
+    tmpfs: [/tmp]
+    restart: "no"
+    depends_on:
       postgres:
         condition: service_healthy
 

@@ -3,11 +3,19 @@
 # SCRAM login and a pipelined round trip, a wrong password failing fast,
 # the account and notes endpoints, memory that comes back, rate limits,
 # metrics, and recovery after the database restarts.
+#
+# Everything runs in a throwaway database (scripts/test-db.sh), created
+# with the migrations and dropped at the end: the development database is
+# never touched.
 set -eu
 cd "$(dirname "$0")/.."
+[ -f .env ] && . ./.env
 
 HOST="${API_DB_HOST:-10.231.0.10}"
 PASS="${API_DB_PASSWORD:-change-me-too}"
+API_DB_NAME="fasm2crud_test_$$"
+export API_DB_NAME
+./scripts/test-db.sh create "$API_DB_NAME"
 status=0
 check() {
 	if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: expected $2, got $3"; status=1; fi
@@ -24,7 +32,7 @@ API_TOKEN_KEY="$KEY" API_AUTH_RATE=100000 API_AUTH_BURST=100000 API_PORT=18090 A
 good=$!
 API_PORT=18091 API_WORKERS=1 API_DB_HOST="$HOST" API_DB_PASSWORD=wrong ./build/fasm2crud 2>/dev/null &
 bad=$!
-trap 'kill $good $bad ${mem:-} ${rl:-} ${met:-} 2>/dev/null || true' EXIT
+trap 'kill $good $bad ${mem:-} ${rl:-} ${met:-} 2>/dev/null || true; ./scripts/test-db.sh drop "$API_DB_NAME"' EXIT
 
 wait_ready 18090 || true
 check "readyz through SCRAM and the query pipeline" 200 "$(code 18090)"

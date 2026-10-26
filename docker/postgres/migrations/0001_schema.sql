@@ -1,4 +1,4 @@
--- Schema for the example CRUD. Runs once, when the data volume is created.
+-- Schema for the example CRUD (applied by scripts/migrate.sh).
 -- Keys are UUIDv7 (PostgreSQL 18): time ordered, so inserts append to the
 -- right edge of the B-tree instead of splitting random pages.
 
@@ -35,3 +35,7 @@ CREATE TABLE notes (
 ) WITH (fillfactor = 90);                           -- room for HOT updates
 -- Keyset pagination: WHERE user_id = $1 AND id < $2 ORDER BY id DESC LIMIT n
 CREATE INDEX notes_user_id_id ON notes (user_id, id DESC);
+
+-- The API role reads and writes rows, nothing else (created by
+-- docker/postgres/init/002_api_role.sh).
+GRANT SELECT, INSERT, UPDATE, DELETE ON users, refresh_tokens, notes TO api;

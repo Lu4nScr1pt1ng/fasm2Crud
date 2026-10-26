@@ -5,7 +5,7 @@ BIN       := build/fasm2crud
 KAT       := build/kat
 FUZZ      := build/fuzz
 
-.PHONY: all toolchain run test itest kat fuzz up down logs bench clean
+.PHONY: all toolchain run test itest kat fuzz up down migrate logs bench clean
 
 all: $(BIN)
 
@@ -56,6 +56,9 @@ up:
 
 down:
 	docker compose down
+
+migrate:
+	docker compose run --rm migrate
 
 logs:
 	docker compose logs -f api
