@@ -47,6 +47,7 @@ include 'app/ratelimit.inc'
 include 'app/auth.inc'
 include 'app/notes.inc'
 include 'app/metrics.inc'
+include 'app/maintenance.inc'
 include 'tools/healthcheck.inc'
 
 segment readable

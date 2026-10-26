@@ -154,6 +154,12 @@ pg_statement STMT_ROTATE_REFRESH, \
 	'ins AS (INSERT INTO refresh_tokens (token_hash, user_id, family_id, expires_at) ', \
 	'SELECT $2::bytea, user_id, family_id, now() + interval ''30 days'' FROM rot RETURNING user_id) ', \
 	'SELECT u.id, u.session_epoch FROM ins JOIN users u ON u.id = ins.user_id'
+; Housekeeping (src/app/maintenance.inc). A token is kept until it expires
+; even when rotated or revoked: reuse detection and a revoked family's
+; refusal to rotate both need its row.
+pg_statement STMT_PURGE_REFRESH, \
+	'DELETE FROM refresh_tokens WHERE token_hash IN (SELECT token_hash FROM refresh_tokens ', \
+	'WHERE expires_at < now() ORDER BY expires_at LIMIT 5000)'
 pg_statement STMT_REVOKE_FAMILY, \
 	'UPDATE refresh_tokens SET revoked_at = now() WHERE family_id = ', \
 	'(SELECT family_id FROM refresh_tokens WHERE token_hash = $1::bytea) AND revoked_at IS NULL'
@@ -1005,8 +1011,11 @@ pg_deliver:
 	pop	rbx
 	ret
 
+DB_BACKGROUND	= -1		; rbx for a query no request waits for
+
 ; Run a prepared statement for the current HTTP request.
-; rbx = HTTP slot, r12 = HTTP connection, edi = STMT_xxx, esi = CONT_xxx,
+; rbx = HTTP slot (or DB_BACKGROUND: then r12 is unused and the reply is
+; dropped), r12 = HTTP connection, edi = STMT_xxx, esi = CONT_xxx,
 ; rdx = parameters (16 bytes each: dq pointer, dd length or -1 for NULL),
 ; ecx = parameter count, r8d = context (id + 1, or 0) handed back to the
 ; continuation.
@@ -1121,14 +1130,18 @@ db_query:
 	shl	ecx,4
 	lea	rsi,[r13+PG_QUEUE+rcx]
 	mov	[rsi+PQ_SLOT],ebx
-	mov	ecx,[r12+C_GEN]
-	mov	[rsi+PQ_GEN],ecx
 	mov	[rsi+PQ_CONT],r15d
 	mov	ecx,[rsp]
 	mov	[rsi+PQ_CTX],ecx
 	inc	eax
 	mov	[r13+PG_QTAIL],eax
+	mov	dword [rsi+PQ_GEN],0
+	cmp	ebx,DB_BACKGROUND
+	je	@f				; nobody waits: the reply is dropped
+	mov	ecx,[r12+C_GEN]
+	mov	[rsi+PQ_GEN],ecx
 	or	dword [r12+C_FLAGS],F_WAIT_DB
+@@:
 
 	push	rbx
 	mov	ebx,r11d

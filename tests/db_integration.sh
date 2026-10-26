@@ -37,6 +37,14 @@ trap 'kill $good $bad ${mem:-} ${rl:-} ${met:-} 2>/dev/null || true; ./scripts/t
 wait_ready 18090 || true
 check "readyz through SCRAM and the query pipeline" 200 "$(code 18090)"
 check "wrong password answers 503" 503 "$(code 18091)"
+psql_test() { docker compose exec -T postgres psql -X -q -t -A -U "${POSTGRES_USER:-fasm2crud}" -d "$API_DB_NAME" -c "$1"; }
+# Expired refresh tokens are purged (worker 0, every 10 s); live ones stay.
+psql_test "WITH u AS (INSERT INTO users (email, password_hash) VALUES ('purge@example.com', 'x') RETURNING id)
+	INSERT INTO refresh_tokens (token_hash, user_id, family_id, expires_at)
+	SELECT sha256(g::text::bytea), u.id, uuidv7(), now() + CASE WHEN g <= 300 THEN interval '-1 day' ELSE interval '1 day' END
+	FROM u, generate_series(1, 310) g" >/dev/null
+sleep 11
+check "expired refresh tokens are purged, live ones kept" "10" "$(psql_test "SELECT count(*) FROM refresh_tokens")"
 python3 -I tests/auth_api.py 18090 "$KEY" || status=1
 python3 -I tests/notes_api.py 18090 || status=1
 

@@ -270,6 +270,7 @@ on_timer:
 	call	hasher_tick
 	call	conn_trim
 	call	metrics_tick
+	call	maintenance_tick
 
 	cmp	dword [g_accept_paused],0
 	je	.sweep_start
