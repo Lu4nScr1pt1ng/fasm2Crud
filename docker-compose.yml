@@ -71,9 +71,12 @@ services:
       postgres:
         condition: service_healthy
 
-  # TLS 1.3 with X25519MLKEM768 at the edge (docker/caddy/Caddyfile).
-  # https://localhost:8443 with a local certificate by default.
+  # Optional TLS proxy (docker/caddy/Caddyfile), off the default path: it
+  # measured ~7-11k req/s and a p99 of ~38 ms against ~230k and 2.9 ms
+  # direct (oha, same client). Start it only for ACME certificates:
+  #   docker compose --profile edge up -d
   edge:
+    profiles: [edge]
     image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     ports:
       - "${EDGE_BIND:-127.0.0.1}:${EDGE_PORT:-8443}:8443"
