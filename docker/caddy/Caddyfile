@@ -1,0 +1,42 @@
+# TLS at the edge (docs/ARCHITECTURE.md): TLS 1.3 only, with the hybrid
+# post-quantum key exchange X25519MLKEM768 first, then the API over the
+# backend network. Defaults give a local certificate for localhost
+# (Caddy's internal CA); set API_DOMAIN to a public name and CADDY_TLS to
+# an e-mail address for an ACME (Let's Encrypt) certificate instead.
+{
+	admin off
+	persist_config off
+	https_port 8443
+	auto_https disable_redirects
+	servers {
+		protocols h1 h2
+	}
+}
+
+{$API_DOMAIN:localhost}:8443 {
+	tls {$CADDY_TLS:internal} {
+		protocols tls1.3
+		curves x25519mlkem768 x25519
+	}
+
+	# Prometheus scrapes the API on the backend network; /metrics is not
+	# for the outside.
+	@metrics path /metrics
+	respond @metrics 404
+
+	header {
+		Strict-Transport-Security "max-age=63072000"
+		-Server
+	}
+
+	# X-Forwarded-For carries the client address the proxy saw; the API
+	# trusts it from this proxy only (API_TRUSTED_PROXY).
+	reverse_proxy 10.231.0.20:8080 {
+		header_up X-Forwarded-For {remote_host}
+		transport http {
+			# Below the API's 60 s keep-alive, so the proxy never reuses a
+			# connection the API is closing.
+			keepalive 30s
+		}
+	}
+}
