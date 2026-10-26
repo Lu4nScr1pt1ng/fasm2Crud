@@ -1,34 +1,34 @@
-; Per-address rate limiting for the account endpoints that cost real work
-; (register, login, refresh: a password hash or a database write).
+; Rate limits per client (src/core/inet.inc: an IPv4 address, an IPv6 /64,
+; or the client a trusted proxy names), for the whole service.
 ;
-; Token buckets, one per client IPv4 address, in a fixed table per worker:
-; API_AUTH_BURST requests at once, refilled at API_AUTH_RATE per minute.
-; Over the limit: 429 with Retry-After set to when the next token comes.
-; Workers share nothing, so the limit is per worker: a client spreading
-; connections over every worker gets up to workers x the rate, which the
-; defaults (10 at once, 30 a minute) allow for.
+; Two classes, each a token bucket per client:
+;   auth     register, login, refresh, password, account: each costs a
+;            password hash or a database write. API_AUTH_BURST at once
+;            (default 10), refilled at API_AUTH_RATE a minute (30).
+;   general  every /v1/ request: API_BURST (500) and API_RATE a minute
+;            (6000); API_RATE=0 turns it off.
+; Over a limit: 429 with Retry-After set to when the next token comes.
 ;
-; The table has RL_SLOTS entries; an address probes RL_PROBE of them. An
-; entry whose bucket has refilled carries no information and is reused
-; first; failing that, the fullest bucket in the window is evicted, so the
-; addresses being limited are the ones that stay.
-;
-; The address: accepted sockets are io_uring direct descriptors, outside
-; the fd table, so getpeername cannot see them. The ring asks instead
-; (IORING_OP_URING_CMD, getsockopt SO_PEERNAME), once per connection and
-; only when a limited endpoint is first requested; the request waits for
-; it like for the database (http_handle returns HTTP_WAIT_PEER).
+; The buckets are one table shared by every worker (MAP_SHARED, mapped
+; before the fork), so a client gets its limit once however its
+; connections spread. An entry is 16 bytes, {key, tokens and stamp}, and
+; changes as a whole with lock cmpxchg16b: no locks, and two workers
+; racing on one client simply retry. Stamps are Unix seconds, the clock
+; every worker shares. A client probes RL_PROBE entries; a free entry is
+; taken first, else the fullest bucket in the window is evicted, so the
+; clients being limited are the ones that stay.
 
-RL_SLOTS	= 8192		; power of two
+RL_SLOTS	= 16384		; power of two; 256 KiB
 RL_PROBE	= 8
-RL_SCALE	= 60		; tokens are kept in 1/60ths: a minute's rate per second
-DEFAULT_AUTH_RATE  = 30		; per minute
+RL_RETRIES	= 8		; then the request passes: never block on contention
+RL_SCALE	= 60		; tokens in 1/60ths: a minute's rate per second
+DEFAULT_AUTH_RATE  = 30
 DEFAULT_AUTH_BURST = 10
+DEFAULT_RATE	= 6000
+DEFAULT_BURST	= 500
 
-; Entry (16 bytes).
-RLE_ADDR	= 0		; IPv4, network order; 0 = never used
-RLE_TOKENS	= 4		; in 1/RL_SCALE
-RLE_TICK	= 8		; tick + 1 of the last refill; 0 = never used
+RL_AUTH		= 0
+RL_GENERAL	= 1
 
 PEER_UNKNOWN	= 0
 PEER_PENDING	= 1
@@ -39,14 +39,17 @@ SO_PEERNAME	= 28
 
 cstring env_auth_rate, 'API_AUTH_RATE='
 cstring env_auth_burst, 'API_AUTH_BURST='
+cstring env_rate, 'API_RATE='
+cstring env_burst, 'API_BURST='
 cstring hdr_retry_prefix, 'Retry-After: '
 
 bss
-	align 16
-	g_rl:		rb RL_SLOTS * 16
-	g_auth_rate	dd ?		; per minute
-	g_auth_burst	dd ?
+	align 8
+	g_rl		dq ?		; the shared table
+	g_rl_rate	rd 2		; per class: per minute (0: off)
+	g_rl_cap	rd 2		; burst * RL_SCALE
 	g_rl_hdr:	rb 32
+	g_peer_warned	dd ?
 end bss
 
 rate_config:
@@ -54,33 +57,75 @@ rate_config:
 	mov	esi,env_auth_rate.len
 	mov	edx,DEFAULT_AUTH_RATE
 	mov	ecx,1
-	mov	r8d,100000
+	mov	r8d,1000000
 	call	env_uint
-	mov	[g_auth_rate],eax
+	mov	[g_rl_rate+RL_AUTH*4],eax
 	lea	rdi,[env_auth_burst]
 	mov	esi,env_auth_burst.len
 	mov	edx,DEFAULT_AUTH_BURST
 	mov	ecx,1
-	mov	r8d,100000
+	mov	r8d,1000000
 	call	env_uint
-	mov	[g_auth_burst],eax
+	imul	eax,eax,RL_SCALE
+	mov	[g_rl_cap+RL_AUTH*4],eax
+	lea	rdi,[env_rate]
+	mov	esi,env_rate.len
+	mov	edx,DEFAULT_RATE
+	xor	ecx,ecx
+	mov	r8d,1000000
+	call	env_uint
+	mov	[g_rl_rate+RL_GENERAL*4],eax
+	lea	rdi,[env_burst]
+	mov	esi,env_burst.len
+	mov	edx,DEFAULT_BURST
+	mov	ecx,1
+	mov	r8d,1000000
+	call	env_uint
+	imul	eax,eax,RL_SCALE
+	mov	[g_rl_cap+RL_GENERAL*4],eax
+	; The table, shared by the workers forked later.
+	xor	edi,edi
+	mov	esi,RL_SLOTS * 16
+	mov	edx,PROT_READ or PROT_WRITE
+	mov	r10d,MAP_SHARED or MAP_ANONYMOUS
+	mov	r8,-1
+	xor	r9d,r9d
+	mov	eax,SYS_mmap
+	syscall
+	cmp	rax,-4095
+	jae	.no_memory
+	mov	[g_rl],rax
 	ret
+.no_memory:
+	call	log_begin
+	log_lit 'cannot map the rate limit table'
+	call	log_end
+	mov	edi,EXIT_FATAL
+	jmp	exit_process
 
-; Does the current request need the client address (a limited endpoint),
-; and is it still unknown? eax = 1 when the request has to wait for it.
-; Starts the lookup if nobody has. r12 = connection, rbx = slot.
+; Does the current request need the client address, still unknown?
+; eax = 1 when it has to wait for it (the lookup is started if nobody
+; has). /v1/auth/ always needs it; every /v1/ route when the general limit
+; is on. r12 = connection, rbx = slot.
 route_needs_peer:
 	xor	eax,eax
 	cmp	dword [r12+C_PEER_STATE],PEER_KNOWN
 	je	.done
+	cmp	dword [req_path_len],4
+	jb	.done
+	mov	rdx,[req_path]
+	cmp	dword [rdx],'/v1/'
+	jne	.done
+	cmp	dword [g_rl_rate+RL_GENERAL*4],0
+	jne	.needed
 	cmp	dword [req_path_len],9
 	jbe	.done
-	mov	rdx,[req_path]
 	mov	rcx,'/v1/auth'
 	cmp	[rdx],rcx
 	jne	.done
 	cmp	byte [rdx+8],'/'
 	jne	.done
+.needed:
 	cmp	dword [r12+C_PEER_STATE],PEER_PENDING
 	je	.wait
 	call	peer_lookup
@@ -100,7 +145,7 @@ peer_lookup:
 	mov	dword [rax+SQE_OFF],SOCKET_URING_OP_GETSOCKOPT	; cmd_op
 	mov	dword [rax+SQE_ADDR],SOL_SOCKET			; level
 	mov	dword [rax+SQE_ADDR+4],SO_PEERNAME		; optname
-	mov	dword [rax+SQE_FILE_INDEX],16			; optlen
+	mov	dword [rax+SQE_FILE_INDEX],C_PEER_ADDR_SIZE	; optlen
 	lea	rcx,[r12+C_PEER_ADDR]
 	mov	[rax+SQE_ADDR3],rcx				; optval
 	mov	rcx,OP_PEER shl 32
@@ -122,7 +167,8 @@ on_peer:
 	mov	dword [r12+C_PEER_STATE],PEER_KNOWN
 	test	r14d,r14d
 	jns	.resume
-	mov	dword [r12+C_PEER_ADDR+4],0
+	mov	qword [r12+C_PEER_ADDR],0
+	mov	qword [r12+C_PEER_ADDR+8],0
 	cmp	dword [g_peer_warned],0
 	jne	.resume
 	mov	dword [g_peer_warned],1
@@ -139,77 +185,119 @@ on_peer:
 	and	dword [r12+C_FLAGS],not F_WAIT_PEER
 	jmp	http_resume
 
-bss
-	g_peer_warned	dd ?
-end bss
-
-; Take a token for the current request's client. CF when there is none:
-; 429 has been answered. r12 = connection.
+; Take a token of class RL_AUTH. CF when there is none: 429 answered.
 rate_take:
+	mov	edi,RL_AUTH
+	jmp	rate_take_class
+
+; The general class, for every /v1/ request (no-op when it is off).
+rate_take_general:
+	cmp	dword [g_rl_rate+RL_GENERAL*4],0
+	jne	@f
+	clc
+	ret
+@@:
+	mov	edi,RL_GENERAL
+	; fall through
+
+; cas_note: the entry address goes through rdi because fasm2 encodes
+; cmpxchg16b [r8..r15] with two REX prefixes (48 41); only the last one
+; counts, which silently turns it into cmpxchg8b.
+
+; edi = class. CF when the client has no token left (429 answered).
+; r12 = connection.
+rate_take_class:
 	push	rbx
+	push	rbp
+	push	r12
 	push	r13
-	mov	r8d,[r12+C_PEER_ADDR+4]		; sin_addr
-	; Hash into the table (Fibonacci hashing), then probe a window.
-	mov	eax,0x9E3779B1
-	imul	eax,r8d
-	shr	eax,32 - 13			; log2 RL_SLOTS
-	xor	r9,r9				; victim
-	xor	r10d,r10d			; its tokens
+	push	r14
+	push	r15
+	mov	ebp,edi
+	call	client_key
+	mov	rcx,0x9E3779B97F4A7C15
+	imul	rcx,rbp
+	xor	rax,rcx				; the class is part of the key
+	or	rax,1
+	mov	r13,rax				; key
+	mov	r14d,RL_RETRIES
+.again:
+	mov	rax,r13
+	shr	rax,64 - 14			; log2 RL_SLOTS
+	mov	r12d,eax			; start of the window
+	xor	r15d,r15d			; victim entry, 0 = none
+	xor	r9d,r9d				; its tokens (+1, so 0 = none)
 	mov	r11d,RL_PROBE
 .probe:
-	mov	ecx,eax
-	shl	ecx,4
-	lea	rbx,[g_rl+rcx]
-	call	.refill
-	cmp	[rbx+RLE_ADDR],r8d
-	jne	.other
-	test	r8d,r8d
-	jnz	.found
-	cmp	dword [rbx+RLE_TICK],0		; address 0 in use, not a free entry
-	jne	.found
-.other:
-	; Candidate for reuse: full buckets carry nothing, else the fullest.
-	mov	ecx,[rbx+RLE_TOKENS]
-	cmp	dword [rbx+RLE_TICK],0
-	jne	@f
-	mov	ecx,-1				; never used: best of all
-@@:
-	cmp	r9,0
-	je	.take
-	cmp	ecx,r10d
-	jbe	.next
-.take:
-	mov	r9,rbx
-	mov	r10d,ecx
-.next:
-	inc	eax
+	mov	eax,r12d
 	and	eax,RL_SLOTS - 1
+	shl	rax,4
+	add	rax,[g_rl]
+	mov	r10,rax
+	mov	rax,[r10]
+	cmp	rax,r13
+	je	.found
+	; Candidate: free beats everything, else the fullest bucket.
+	mov	ecx,-1
+	test	rax,rax
+	jz	@f
+	mov	rdx,[r10+8]
+	call	.refill
+	inc	ecx
+@@:
+	cmp	ecx,r9d
+	jbe	.next
+	mov	r9d,ecx
+	mov	r15,r10
+.next:
+	inc	r12d
 	dec	r11d
 	jnz	.probe
-	; Not found: a new bucket, full, in the victim's place.
-	mov	rbx,r9
-	mov	[rbx+RLE_ADDR],r8d
-	mov	eax,[g_auth_burst]
-	imul	eax,eax,RL_SCALE
-	mov	[rbx+RLE_TOKENS],eax
-	mov	eax,[g_tick]
-	inc	eax
-	mov	[rbx+RLE_TICK],eax
+	; Not there: a full bucket for this client in the victim's place.
+	mov	r10,r15
+	mov	rax,[r10]
+	mov	rdx,[r10+8]
+	mov	rbx,r13
+	mov	ecx,[g_rl_cap+rbp*4]
+	sub	ecx,RL_SCALE
+	mov	r8d,dword [g_unix_now]
+	shl	r8,32
+	or	rcx,r8
+	mov	rdi,r10			; see cas_note
+	lock cmpxchg16b [rdi]
+	jz	.allowed
+	jmp	.retry
 .found:
-	cmp	dword [rbx+RLE_TOKENS],RL_SCALE
+	mov	rdx,[r10+8]
+	call	.refill				; ecx = tokens now
+	cmp	ecx,RL_SCALE
 	jb	.limited
-	sub	dword [rbx+RLE_TOKENS],RL_SCALE
+	sub	ecx,RL_SCALE
+	mov	r8d,dword [g_unix_now]
+	shl	r8,32
+	or	rcx,r8
+	mov	rbx,r13
+	mov	rax,r13
+	mov	rdi,r10			; see cas_note
+	lock cmpxchg16b [rdi]
+	jz	.allowed
+.retry:
+	dec	r14d
+	jnz	.again
+.allowed:
 	clc
 	jmp	.done
 .limited:
+	mov	r12,[rsp+24]			; the connection again
 	metric_inc M_RATE_LIMITED
 	; Seconds until a whole token: (RL_SCALE - tokens) / rate, rounded up.
 	mov	eax,RL_SCALE
-	sub	eax,[rbx+RLE_TOKENS]
-	add	eax,[g_auth_rate]
+	sub	eax,ecx
+	mov	ecx,[g_rl_rate+rbp*4]
+	add	eax,ecx
 	dec	eax
 	xor	edx,edx
-	div	dword [g_auth_rate]
+	div	ecx
 	test	eax,eax
 	jnz	@f
 	inc	eax
@@ -232,28 +320,32 @@ rate_take:
 	call	respond
 	stc
 .done:
+	pop	r15
+	pop	r14
 	pop	r13
+	pop	r12
+	pop	rbp
 	pop	rbx
 	ret
 
-; Refill the bucket at rbx up to the burst. Clobbers ecx, edx.
+; rdx = state (tokens | stamp << 32), ebp = class. ecx = tokens now,
+; refilled up to the cap. Clobbers r8.
 .refill:
-	mov	ecx,[rbx+RLE_TICK]
-	test	ecx,ecx
-	jz	.refilled
-	mov	edx,[g_tick]
-	inc	edx
-	sub	edx,ecx
-	jz	.refilled
-	imul	edx,[g_auth_rate]		; per second, in 1/60ths
-	add	edx,[rbx+RLE_TOKENS]
-	mov	ecx,[g_auth_burst]
-	imul	ecx,ecx,RL_SCALE
-	cmp	edx,ecx
-	cmova	edx,ecx
-	mov	[rbx+RLE_TOKENS],edx
-	mov	edx,[g_tick]
-	inc	edx
-	mov	[rbx+RLE_TICK],edx
+	mov	ecx,edx				; tokens
+	mov	r8,rdx
+	shr	r8,32				; stamp
+	push	rax
+	mov	eax,dword [g_unix_now]
+	sub	eax,r8d
+	jbe	.refilled			; same second (or a clock step back)
+	imul	eax,[g_rl_rate+rbp*4]
+	jo	.full
+	add	ecx,eax
+	jc	.full
+	cmp	ecx,[g_rl_cap+rbp*4]
+	jbe	.refilled
+.full:
+	mov	ecx,[g_rl_cap+rbp*4]
 .refilled:
+	pop	rax
 	ret

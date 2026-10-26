@@ -31,6 +31,7 @@ bss
 	req_ctype	dq ?
 	req_auth	dq ?
 	req_if_match	dq ?
+	req_xff		dq ?		; X-Forwarded-For (trusted only from API_TRUSTED_PROXY)
 	req_method	dd ?
 	req_version	dd ?		; 10 or 11
 	req_flags	dd ?
@@ -43,6 +44,7 @@ bss
 	req_ctype_len	dd ?
 	req_auth_len	dd ?
 	req_if_match_len dd ?
+	req_xff_len	dd ?
 	REQ_SIZE = $ - g_req
 end bss
 
@@ -391,6 +393,8 @@ header_field:
 	je	.len13
 	cmp	r11d,14
 	je	.len14
+	cmp	r11d,15
+	je	.len15
 	cmp	r11d,17
 	je	.len17
 .ignore:
@@ -490,6 +494,21 @@ header_field:
 	cmp	ecx,r13d
 	jb	.digit
 	mov	[req_length],eax
+	jmp	.ignore
+
+.len15:
+	mov	rax,[r10]
+	or	rax,rcx
+	mov	rdx,'x-forwar'
+	cmp	rax,rdx
+	jne	.ignore
+	mov	rax,[r10+7]
+	or	rax,rcx
+	mov	rdx,'rded-for'
+	cmp	rax,rdx
+	jne	.ignore
+	mov	[req_xff],r12
+	mov	[req_xff_len],r13d
 	jmp	.ignore
 
 .len17:

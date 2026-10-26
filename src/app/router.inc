@@ -49,6 +49,8 @@ route:
 	jne	.notes
 	cmp	byte [rsi+8],'/'
 	jne	.not_found
+	call	.general
+	jc	.limited
 	jmp	auth_route
 .notes:
 	mov	rcx,'/v1/note'
@@ -56,7 +58,19 @@ route:
 	jne	.not_found
 	cmp	byte [rsi+8],'s'
 	jne	.not_found
+	call	.general
+	jc	.limited
 	jmp	notes_route
+; The general limit, for every /v1/ request. rsi/eax survive.
+.general:
+	push	rsi
+	push	rax
+	call	rate_take_general
+	pop	rax
+	pop	rsi
+	ret
+.limited:
+	ret
 
 .len8:
 	mov	rax,'/healthz'

@@ -24,6 +24,7 @@ rodata
 	sigact_ignore	dq SIG_IGN, 0, 0, 0	; handler, flags, restorer, mask
 	ts_respawn_delay dq 0, 250000000	; 250 ms
 	one_int		dd 1
+	zero_int	dd 0
 	defer_accept_secs dd 5
 end rodata
 
@@ -124,8 +125,20 @@ supervisor_main:
 	jmp	exit_process
 
 ; Socket for worker ebx. Exits on failure: without it the service cannot run.
+; Dual-stack: an IPv6 socket that takes IPv4 too (as ::ffff:a.b.c.d).
+; Without IPv6 in the kernel, a plain IPv4 socket.
 listener_open:
 	push	r12
+	push	r13
+	mov	r13d,AF_INET6
+	mov	edi,AF_INET6
+	mov	esi,SOCK_STREAM or SOCK_CLOEXEC
+	xor	edx,edx
+	mov	eax,SYS_socket
+	syscall
+	test	eax,eax
+	jns	@f
+	mov	r13d,AF_INET
 	mov	edi,AF_INET
 	mov	esi,SOCK_STREAM or SOCK_CLOEXEC
 	xor	edx,edx
@@ -133,7 +146,15 @@ listener_open:
 	syscall
 	test	eax,eax
 	js	.failed
+@@:
 	mov	r12d,eax
+	cmp	r13d,AF_INET6
+	jne	@f
+	mov	esi,IPPROTO_IPV6
+	mov	edx,IPV6_V6ONLY
+	lea	r10,[zero_int]
+	call	.setsockopt
+@@:
 
 	mov	esi,SOL_SOCKET
 	mov	edx,SO_REUSEADDR
@@ -155,20 +176,29 @@ listener_open:
 	lea	r10,[defer_accept_secs]
 	call	.setsockopt
 
-	; struct sockaddr_in { family, port (big endian), 0.0.0.0, zero[8] }
-	sub	rsp,16
+	; struct sockaddr_in { family, port (big endian), 0.0.0.0, zero[8] }, or
+	; sockaddr_in6 { family, port, flowinfo, :: (16), scope id }: all zero
+	; but the first two fields either way.
+	sub	rsp,32
 	mov	eax,[g_port]
 	xchg	al,ah
 	shl	eax,16
-	or	eax,AF_INET
+	or	eax,r13d
 	mov	qword [rsp],rax
-	mov	qword [rsp+8],0
+	xor	eax,eax
+	mov	[rsp+8],rax
+	mov	[rsp+16],rax
+	mov	[rsp+24],rax
 	mov	edi,r12d
 	mov	rsi,rsp
 	mov	edx,16
+	cmp	r13d,AF_INET6
+	jne	@f
+	mov	edx,28
+@@:
 	mov	eax,SYS_bind
 	syscall
-	add	rsp,16
+	add	rsp,32
 	test	eax,eax
 	js	.failed
 	mov	edi,r12d
@@ -178,6 +208,7 @@ listener_open:
 	test	eax,eax
 	js	.failed
 	mov	eax,r12d
+	pop	r13
 	pop	r12
 	ret
 

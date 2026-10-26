@@ -36,7 +36,7 @@ wait_ready() {
 
 # A known signing key, so tests/auth_api.py can check tokens independently.
 KEY="$(head -c32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=')"
-API_TOKEN_KEY="$KEY" API_AUTH_RATE=100000 API_AUTH_BURST=100000 API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+API_TOKEN_KEY="$KEY" API_AUTH_RATE=100000 API_AUTH_BURST=100000 API_RATE=0 API_PORT=18090 API_WORKERS=2 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
 good=$!
 API_PORT=18091 API_WORKERS=1 API_DB_HOST="$HOST" API_DB_PASSWORD=wrong ./build/fasm2crud 2>/dev/null &
 bad=$!
@@ -57,14 +57,15 @@ python3 -I tests/auth_api.py 18090 "$KEY" || status=1
 python3 -I tests/notes_api.py 18090 || status=1
 
 # Memory follows the load and goes back; the large buffer pool is bounded.
-API_PORT=18092 API_WORKERS=1 API_TRIM_IDLE=2 API_LARGE_BUFFERS=4 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+API_PORT=18092 API_WORKERS=1 API_RATE=0 API_TRIM_IDLE=2 API_LARGE_BUFFERS=4 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
 mem=$!
 wait_ready 18092 || true
 python3 -I tests/memory_api.py 18092 || status=1
 kill $mem 2>/dev/null || true
 
-# Per-address limits on the account endpoints.
-API_PORT=18093 API_WORKERS=1 API_AUTH_RATE=6 API_AUTH_BURST=3 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
+# Rate limits per client for the whole service: IPv4, IPv6 /64, behind a
+# trusted proxy, the auth and the general class.
+API_PORT=18093 API_WORKERS=2 API_AUTH_RATE=6 API_AUTH_BURST=3 API_RATE=60 API_BURST=8 API_TRUSTED_PROXY=127.0.0.1 API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>/dev/null &
 rl=$!
 wait_ready 18093 || true
 python3 -I tests/ratelimit_api.py 18093 || status=1

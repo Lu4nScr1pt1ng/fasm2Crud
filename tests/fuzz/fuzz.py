@@ -10,6 +10,7 @@ from tests/kat/differential_input.py, which is checked against Python's
 json). A mismatch or a crash prints the input and fails.
 """
 import importlib.util
+import ipaddress
 import json
 import os
 import random
@@ -196,6 +197,62 @@ def expected_json(body):
     return (code, values if code == 0 else None)
 
 
+# ------------------------------------------------------------ reference IP
+
+def expected_ipv4(data):
+    # Four decimal octets of 1 to 3 digits, each at most 255 (leading zeros
+    # allowed, unlike Python's parser, which is otherwise the reference).
+    parts = data.split(b".")
+    if len(parts) != 4 or not all(1 <= len(p) <= 3 and p.isdigit() and p.isascii() for p in parts):
+        return (0, None)
+    vals = [int(p) for p in parts]
+    if any(v > 255 for v in vals):
+        return (0, None)
+    return (1, bytes(vals))
+
+
+def expected_ipv6(data):
+    # Python's ipaddress, without the forms the server does not take
+    # (embedded IPv4, zones).
+    if b"." in data or b"%" in data:
+        return (0, None)
+    try:
+        return (1, ipaddress.IPv6Address(data.decode("ascii")).packed)
+    except (ValueError, UnicodeDecodeError):
+        return (0, None)
+
+
+def read_ip(size):
+    def read(out, pos):
+        if out[pos] == 0:
+            return (0, None), pos + 1
+        return (1, bytes(out[pos + 1:pos + 1 + size])), pos + 1 + size
+    return read
+
+
+TRICKY_V6 = [b"::", b"::1", b"1::", b"1:2:3:4:5:6:7:8", b"1:2:3:4:5:6:7:8::", b"::1:2:3:4:5:6:7:8",
+             b"1:2:3:4:5:6:7::", b"::2:3:4:5:6:7:8", b"1::8", b"1:::8", b"1::2::3", b":1", b"1:", b"1:2:3:4:5:6:7:8:9",
+             b"12345::", b"fffff::", b"::ffff:1.2.3.4", b"fe80::1%eth0", b"", b":"]
+
+
+def gen_ip(v6):
+    r = rng.random()
+    if v6 and r < 0.05:
+        return rng.choice(TRICKY_V6)
+    if v6:
+        if r < 0.5:
+            a = ipaddress.IPv6Address(rng.getrandbits(128) & rng.choice([(1 << 128) - 1, ((1 << 64) - 1) << 64, 0xFFFF << 112, 1]))
+            text = rng.choice([a.compressed, a.exploded]).encode()
+        else:
+            text = b":".join(rng.choice([b"", b"0", b"ffff", b"12345", b"g", b"1", b"db8", b":"]) for _ in range(rng.randrange(1, 10)))
+    else:
+        if r < 0.5:
+            text = ".".join(str(rng.randrange(256)) for _ in range(4)).encode()
+        else:
+            text = b".".join(rng.choice([b"", b"0", b"00", b"255", b"256", b"1234", b"a", b"001"]) for _ in range(rng.randrange(1, 6)))
+    return mutate(text) if rng.random() < 0.3 else text
+
+
 # ------------------------------------------------------------ generators
 
 TARGETS = [b"/", b"/healthz", b"/v1/notes", b"/v1/notes?limit=5&cursor=x", b"/a?b?c", b"/%20", b"/a#b",
@@ -338,7 +395,7 @@ def results(out, cases):
     for kind, _ in cases:
         if pos >= len(out):
             break
-        r, pos = (read_http if kind == 0 else read_json)(out, pos)
+        r, pos = (read_http, read_json, read_ip(4), read_ip(16))[kind](out, pos)
         got.append(r)
     return got
 
@@ -355,29 +412,30 @@ def find_crash(cases):
 
 
 def main():
-    print(f"fuzz: {CASES} HTTP and {CASES} JSON cases, seed {SEED}")
+    print(f"fuzz: {CASES} cases each of HTTP, JSON, IPv4 and IPv6, seed {SEED}")
     failures = 0
     batch = 4000
-    for kind, gen, expect in ((0, gen_http, expected_http), (1, gen_json, expected_json)):
+    for kind, gen, expect in ((0, gen_http, expected_http), (1, gen_json, expected_json),
+                              (2, lambda: gen_ip(False), expected_ipv4), (3, lambda: gen_ip(True), expected_ipv6)):
         done = 0
         while done < CASES:
             cases = [(kind, gen()) for _ in range(min(batch, CASES - done))]
             code, out = run(cases)
             if code != 0:
                 bad = find_crash(cases)
-                print(f"CRASH (exit {code}) on {'HTTP' if kind == 0 else 'JSON'} input {bad[1]!r}")
+                print(f"CRASH (exit {code}) on {('HTTP', 'JSON', 'IPv4', 'IPv6')[kind]} input {bad[1]!r}")
                 return 1
             for (k, data), got in zip(cases, results(out, cases)):
                 want = expect(data)
                 if got != want:
                     failures += 1
                     if failures <= 10:
-                        print(f"MISMATCH {'HTTP' if k == 0 else 'JSON'} {data!r}\n  asm  {got}\n  ref  {want}")
+                        print(f"MISMATCH {('HTTP', 'JSON', 'IPv4', 'IPv6')[k]} {data!r}\n  asm  {got}\n  ref  {want}")
             done += len(cases)
     if failures:
         print(f"{failures} mismatches (seed {SEED})")
         return 1
-    print(f"{2 * CASES} fuzz cases agree with the reference")
+    print(f"{4 * CASES} fuzz cases agree with the reference")
     return 0
 
 

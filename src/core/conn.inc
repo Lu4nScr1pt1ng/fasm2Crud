@@ -46,7 +46,8 @@ C_IN_SINCE	= 104		; tick the large buffers were taken
 C_OUT_SINCE	= 108
 C_T0		= 112		; dq: TSC when the current request was parsed (0: none)
 C_PEER_STATE	= 120		; PEER_xxx (src/app/ratelimit.inc)
-C_PEER_ADDR	= 128		; sockaddr_in of the client, once known
+C_PEER_ADDR	= 128		; sockaddr_in6 (or sockaddr_in) of the client, once known
+C_PEER_ADDR_SIZE = 28
 
 CONN_KEEP	= 0		; the whole slot can go back
 CONN_WARM	= 64		; free slots always kept resident

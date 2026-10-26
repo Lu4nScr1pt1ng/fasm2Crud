@@ -6,6 +6,8 @@
 ; Case: db kind, dd length, bytes. Kinds:
 ;   0  HTTP: find_header_end, then parse_request on the header block
 ;   1  JSON: json_parse_object with the credentials schema
+;   2  IPv4 text: ipv4_text
+;   3  IPv6 text: ipv6_text
 ;
 ; Every input ends right where the memory does: the HTTP data is followed
 ; by exactly the 32 bytes the SIMD scans may read past it (filled with
@@ -27,6 +29,8 @@ segment readable executable
 include '../../src/core/util.inc'
 include '../../src/http/parser.inc'
 include '../../src/http/json.inc'
+include '../../src/core/hex.inc'
+include '../../src/core/ipaddr.inc'
 
 FUZZ_MAX	= 65536
 SLACK		= 32
@@ -205,6 +209,10 @@ start:
 	je	.http
 	cmp	byte [g_case_kind],1
 	je	.json
+	cmp	byte [g_case_kind],2
+	je	.ipv4
+	cmp	byte [g_case_kind],3
+	je	.ipv6
 .bad_input:
 	call	out_flush
 	mov	edi,2
@@ -315,6 +323,65 @@ start:
 	pop	rax
 	xor	eax,eax
 	jmp	out_u32
+
+; Result: db 1 when valid, then dd address (IPv4) or 16 bytes (IPv6).
+; The text ends at the guard page, like the JSON bodies.
+.ipv4:
+	call	.place
+	mov	edx,[g_case_len]
+	call	ipv4_text
+	jmp	.ip_out4
+.ipv6:
+	call	.place
+	mov	edx,[g_case_len]
+	sub	rsp,16
+	mov	rdi,rsp
+	call	ipv6_text
+	jc	.ip_bad6
+	push	1
+	mov	rsi,rsp
+	mov	edx,1
+	call	out_bytes
+	add	rsp,8
+	mov	rsi,rsp
+	mov	edx,16
+	call	out_bytes
+	add	rsp,16
+	jmp	.case
+.ip_bad6:
+	add	rsp,16
+	jmp	.ip_bad
+.ip_out4:
+	jc	.ip_bad
+	push	rax
+	push	1
+	mov	rsi,rsp
+	mov	edx,1
+	call	out_bytes
+	add	rsp,8
+	mov	rsi,rsp
+	mov	edx,4
+	call	out_bytes
+	add	rsp,8
+	jmp	.case
+.ip_bad:
+	push	0
+	mov	rsi,rsp
+	mov	edx,1
+	call	out_bytes
+	add	rsp,8
+	jmp	.case
+
+; The case at the end of the JSON area: rsi = its start.
+.place:
+	mov	rdi,[g_json_area]
+	mov	ecx,[g_case_len]
+	sub	rdi,rcx
+	push	rdi
+	lea	rsi,[g_case]
+	rep	movsb
+	pop	rsi
+	ret
 
 ; Result: db code, then per field: db present, dw length, the bytes.
 .json:

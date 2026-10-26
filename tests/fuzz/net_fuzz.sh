@@ -13,7 +13,7 @@ if [ -z "${API_DB_NAME:-}" ]; then
 	./scripts/test-db.sh create "$API_DB_NAME"
 fi
 export API_DB_NAME
-API_PORT=18097 API_WORKERS=2 API_AUTH_RATE=100000 API_AUTH_BURST=100000 API_LARGE_BUFFERS=16 \
+API_PORT=18097 API_WORKERS=2 API_AUTH_RATE=100000 API_AUTH_BURST=100000 API_RATE=0 API_LARGE_BUFFERS=16 \
 	API_DB_HOST="$HOST" API_DB_PASSWORD="$PASS" ./build/fasm2crud 2>build/net_fuzz.log &
 pid=$!
 trap 'kill $pid 2>/dev/null || true; [ -n "$own_db" ] && ./scripts/test-db.sh drop "$own_db"; true' EXIT
