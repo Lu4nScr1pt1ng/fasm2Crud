@@ -21,18 +21,22 @@
 
 HCONT_REGISTER	= 0
 HCONT_LOGIN	= 1
+HCONT_PW_VERIFY	= 2
+HCONT_PW_NEW	= 3
 
 AUTH_SCRATCH	= 17408		; decoded JSON members (a note's: 800 + 16000 bytes)
 
 cstring name_email, 'email'
 cstring name_password, 'password'
 cstring name_refresh_token, 'refresh_token'
+cstring name_new_password, 'new_password'
 cstring allow_post, 'Allow: POST',13,10
+cstring allow_delete, 'Allow: DELETE',13,10
 cstring hdr_retry_after, 'Retry-After: 1',13,10
 
 rodata
 	align 8
-	hash_cont_tbl	dq hcont_register, hcont_login
+	hash_cont_tbl	dq hcont_register, hcont_login, hcont_pw_verify, hcont_pw_new
 	spec_credentials:
 		dq name_email
 		dd name_email.len, EMAIL_MAX
@@ -41,6 +45,11 @@ rodata
 	spec_refresh:
 		dq name_refresh_token
 		dd name_refresh_token.len, 64
+	spec_password_change:
+		dq name_password
+		dd name_password.len, PASSWORD_MAX
+		dq name_new_password
+		dd name_new_password.len, PASSWORD_MAX
 end rodata
 
 bss
@@ -64,6 +73,11 @@ end macro
 auth_route:
 	sub	eax,9
 	lea	rdx,[rsi+9]
+	; rax = handler, ecx = method, r8d = 1 when it takes a JSON body.
+	mov	ecx,M_POST
+	mov	r8d,1
+	cmp	eax,10
+	je	.len10
 	cmp	eax,8
 	je	.len8
 	cmp	eax,7
@@ -75,18 +89,39 @@ auth_route:
 .not_found:
 	mov	edi,ST_404
 	jmp	respond_status
+.len10:
+	mov	rax,'logout-a'
+	cmp	[rdx],rax
+	jne	.not_found
+	cmp	word [rdx+8],'ll'
+	jne	.not_found
+	lea	rax,[auth_logout_all]
+	xor	r8d,r8d				; no body
+	jmp	.endpoint
 .len8:
 	mov	rax,'register'
 	cmp	[rdx],rax
-	jne	.not_found
 	lea	rax,[auth_register]
+	je	.endpoint
+	mov	rax,'password'
+	cmp	[rdx],rax
+	jne	.not_found
+	lea	rax,[auth_password]
 	jmp	.endpoint
 .len7:
 	cmp	dword [rdx],'refr'
-	jne	.not_found
+	jne	.account
 	cmp	dword [rdx+3],'resh'
 	jne	.not_found
 	lea	rax,[auth_refresh]
+	jmp	.endpoint
+.account:
+	cmp	dword [rdx],'acco'
+	jne	.not_found
+	cmp	dword [rdx+3],'ount'
+	jne	.not_found
+	lea	rax,[auth_delete_account]
+	mov	ecx,M_DELETE
 	jmp	.endpoint
 .len6:
 	cmp	dword [rdx],'logo'
@@ -102,15 +137,19 @@ auth_route:
 	jne	.not_found
 	lea	rax,[auth_login]
 .endpoint:
-	cmp	dword [req_method],M_POST
-	jne	.post_only
+	cmp	[req_method],ecx
+	jne	.wrong_method
+	test	r8d,r8d
+	jz	.call
 	push	rax
 	call	json_content_type
 	pop	rcx
 	test	eax,eax
 	jz	.media_type
-	call	rcx
-	; The scratch held the decoded password.
+	mov	rax,rcx
+.call:
+	call	rax
+	; The scratch held decoded passwords.
 	lea	rdi,[g_auth_scratch]
 	mov	ecx,AUTH_SCRATCH
 	call	secure_zero
@@ -120,14 +159,20 @@ auth_route:
 .media_type:
 	mov	edi,ST_415
 	jmp	respond_status
-.post_only:
+.wrong_method:
+	lea	r9,[allow_post]
+	mov	r8d,allow_post.len
+	cmp	ecx,M_DELETE
+	jne	@f
+	lea	r9,[allow_delete]
+	mov	r8d,allow_delete.len
+@@:
 	mov	eax,ST_405
 	shl	eax,5
 	mov	rsi,[status_tbl+rax+16]
 	mov	edx,[status_tbl+rax+24]
 	mov	edi,ST_405
-	lea	rcx,[allow_post]
-	mov	r8d,allow_post.len
+	mov	rcx,r9
 	jmp	respond
 
 ; eax = 1 when Content-Type is application/json, parameters allowed.
@@ -932,3 +977,393 @@ cont_logout:
 	cmp	eax,PGR_OK
 	jne	respond_db_unavailable
 	jmp	respond_no_content
+
+; ---------------------------------------------------------------- sessions
+;
+;   POST   /v1/auth/logout-all   (Bearer)                              204
+;   POST   /v1/auth/password     (Bearer) {"password","new_password"}  204
+;   DELETE /v1/auth/account      (Bearer) {"password"}                 204
+;
+; Each ends every session of the account: the epoch moves on (or the user
+; is gone), so access tokens already issued stop working at once (the
+; notes statements check it) and every refresh token is revoked. 401 when
+; the token's session has already ended or the password is wrong. The
+; password ones hash like a login, so they are rate limited like one.
+
+; logout-all: one statement.
+auth_logout_all:
+	call	note_auth
+	jc	.done
+	call	session_params
+	mov	edi,STMT_LOGOUT_ALL
+	mov	esi,CONT_SESSION_COUNT
+	mov	ecx,2
+	jmp	note_query
+.done:
+	ret
+
+; g_note_params = the session's user and epoch.
+session_params:
+	note_param 0, g_note_uid, 36
+	mov	ecx,[g_note_epoch_len]
+	note_param 1, g_note_epoch, ecx
+	ret
+
+; eax = PGR_xxx, ecx = context (0 for logout-all): one row, count(*) of
+; the users the statement found: 1 means done, 0 a dead session.
+cont_session_count:
+	push	r13
+	mov	r13d,ecx
+	cmp	eax,PGR_OK
+	jne	.failed
+	xor	ecx,ecx
+	call	pg_row_field
+	jc	.error
+	cmp	edx,1
+	jne	.error
+	cmp	byte [rax],'1'
+	je	.done_ok
+	cmp	byte [rax],'0'
+	jne	.error
+	mov	edi,ST_401
+	call	respond_status
+	jmp	.done
+.done_ok:
+	call	respond_no_content
+	jmp	.done
+.error:
+	mov	edi,ST_500
+	call	respond_status
+	jmp	.done
+.failed:
+	call	respond_query_failed
+.done:
+	mov	edi,r13d
+	call	auth_ctx_free
+	pop	r13
+	ret
+
+; Password change and account deletion share the first steps: check the
+; session and the current password. esi = spec fields (2 or 1),
+; edi = spec, edx = AC flags for the context.
+auth_password:
+	lea	rdi,[spec_password_change]
+	mov	esi,2
+	xor	edx,edx
+	jmp	auth_with_password
+
+auth_delete_account:
+	lea	rdi,[spec_credentials+JF_SIZE]	; {"password"}
+	mov	esi,1
+	mov	edx,ACF_DELETE
+	; fall through
+
+auth_with_password:
+	push	r12
+	push	r13
+	push	r15
+	push	rdi
+	push	rsi
+	push	rdx
+	call	rate_take
+	jc	.drop3
+	call	note_auth
+	jc	.drop3
+	pop	rdx
+	pop	rsi
+	pop	rdi
+	push	rdx
+	push	rsi
+	call	auth_parse
+	pop	rsi
+	test	eax,eax
+	jnz	.status_pop
+	; A new password must be acceptable; a current one can never be empty.
+	cmp	esi,2
+	jne	@f
+	mov	esi,[g_auth_vals+JV_SIZE+JV_LEN]
+	call	password_acceptable
+	test	eax,eax
+	jz	.invalid_pop
+@@:
+	cmp	dword [g_auth_vals+JV_LEN],0
+	je	.refused_pop
+	call	auth_ctx_alloc
+	test	eax,eax
+	jz	.busy_pop
+	mov	r13d,eax
+	mov	edi,eax
+	call	auth_ctx_ptr
+	mov	r15,rax
+	pop	rdx
+	mov	[r15+AC_FLAGS],edx
+	; Session, current password, new password (in the e-mail field).
+	lea	rsi,[g_note_uid]
+	lea	rdi,[r15+AC_USER]
+	mov	ecx,36
+	rep	movsb
+	mov	ecx,[g_note_epoch_len]
+	mov	[r15+AC_EPOCH_LEN],ecx
+	lea	rsi,[g_note_epoch]
+	lea	rdi,[r15+AC_EPOCH]
+	rep	movsb
+	mov	ecx,[g_auth_vals+JV_LEN]
+	mov	[r15+AC_PW_LEN],ecx
+	mov	rsi,[g_auth_vals+JV_PTR]
+	lea	rdi,[r15+AC_PW]
+	rep	movsb
+	test	dword [r15+AC_FLAGS],ACF_DELETE
+	jnz	@f
+	mov	ecx,[g_auth_vals+JV_SIZE+JV_LEN]
+	mov	[r15+AC_EMAIL_LEN],ecx
+	mov	rsi,[g_auth_vals+JV_SIZE+JV_PTR]
+	lea	rdi,[r15+AC_EMAIL]
+	rep	movsb
+@@:
+	call	session_params
+	mov	edi,STMT_SESSION_HASH
+	mov	esi,CONT_PW_USER
+	lea	rdx,[g_note_params]
+	mov	ecx,2
+	mov	r8d,r13d
+	call	db_query
+	test	eax,eax
+	jz	.done
+	mov	edi,r13d
+	call	auth_ctx_free
+	call	respond_db_unavailable
+	jmp	.done
+.drop3:
+	add	rsp,24
+	jmp	.done
+.invalid_pop:
+	add	rsp,8
+	mov	edi,ST_422
+	call	respond_status
+	jmp	.done
+.refused_pop:
+	add	rsp,8
+	mov	edi,ST_401
+	call	respond_status
+	jmp	.done
+.busy_pop:
+	add	rsp,8
+	call	respond_busy
+	jmp	.done
+.status_pop:
+	add	rsp,8
+	mov	edi,eax
+	call	respond_status
+.done:
+	pop	r15
+	pop	r13
+	pop	r12
+	ret
+
+; eax = PGR_xxx, ecx = context, rsi/rdx = reply: the stored hash of a live
+; session, or no row.
+cont_pw_user:
+	push	r13
+	push	r15
+	mov	r13d,ecx
+	push	rax
+	push	rsi
+	push	rdx
+	mov	edi,ecx
+	call	auth_ctx_ptr
+	mov	r15,rax
+	pop	rdx
+	pop	rsi
+	pop	rax
+	cmp	eax,PGR_OK
+	jne	.failed
+	xor	ecx,ecx
+	call	pg_row_field
+	jc	.refused
+	mov	rsi,rax
+	lea	rdi,[r15+AC_PHC]
+	call	phc_decode
+	test	eax,eax
+	jnz	.error
+	mov	edi,r13d
+	lea	rsi,[r15+AC_PHC+PHC_SALT]
+	mov	edx,[r15+AC_PHC+PHC_SALT_LEN]
+	mov	ecx,[r15+AC_PHC+PHC_M]
+	mov	r8d,[r15+AC_PHC+PHC_T]
+	mov	r9d,HCONT_PW_VERIFY
+	call	hasher_submit
+	test	eax,eax
+	jz	.done
+	mov	edi,r13d
+	call	auth_ctx_free
+	call	respond_busy
+	jmp	.done
+.refused:
+	mov	edi,ST_401
+	jmp	.answer
+.error:
+	mov	edi,ST_500
+.answer:
+	push	rdi
+	mov	edi,r13d
+	call	auth_ctx_free
+	pop	rdi
+	call	respond_status
+	jmp	.done
+.failed:
+	push	rax
+	mov	edi,r13d
+	call	auth_ctx_free
+	pop	rax
+	call	respond_query_failed
+.done:
+	pop	r15
+	pop	r13
+	ret
+
+; The current password was hashed: eax = HASH_xxx, ecx = context, rsi = tag.
+hcont_pw_verify:
+	push	r13
+	push	r14
+	push	r15
+	mov	r13d,ecx
+	mov	r14d,eax
+	push	rsi
+	mov	edi,ecx
+	call	auth_ctx_ptr
+	mov	r15,rax
+	lea	rdi,[r15+AC_PW]
+	mov	ecx,PASSWORD_MAX
+	call	secure_zero
+	pop	rdi
+	test	r14d,r14d
+	jnz	.hash_failed
+	lea	rsi,[r15+AC_PHC+PHC_HASH]
+	mov	edx,PW_HASH_LEN
+	call	ct_equal
+	test	eax,eax
+	jz	.refused
+	test	dword [r15+AC_FLAGS],ACF_DELETE
+	jnz	.delete
+	; Hash the new password, with a new salt.
+	mov	ecx,[r15+AC_EMAIL_LEN]
+	mov	[r15+AC_PW_LEN],ecx
+	lea	rsi,[r15+AC_EMAIL]
+	lea	rdi,[r15+AC_PW]
+	rep	movsb
+	lea	rdi,[r15+AC_EMAIL]
+	mov	ecx,256
+	call	secure_zero
+	lea	rdi,[r15+AC_SALT]
+	mov	esi,PW_SALT_LEN
+	call	random_bytes
+	test	eax,eax
+	jnz	.busy
+	mov	edi,r13d
+	lea	rsi,[r15+AC_SALT]
+	mov	edx,PW_SALT_LEN
+	mov	ecx,PW_M_KIB
+	mov	r8d,PW_T
+	mov	r9d,HCONT_PW_NEW
+	call	hasher_submit
+	test	eax,eax
+	jz	.done
+.busy:
+	mov	edi,r13d
+	call	auth_ctx_free
+	call	respond_busy
+	jmp	.done
+.delete:
+	mov	rdi,r15
+	call	ctx_session_params
+	mov	edi,STMT_DELETE_USER
+	mov	esi,CONT_SESSION_COUNT
+	lea	rdx,[g_note_params]
+	mov	ecx,2
+	mov	r8d,r13d
+	call	db_query
+	test	eax,eax
+	jz	.done
+	mov	edi,r13d
+	call	auth_ctx_free
+	call	respond_db_unavailable
+	jmp	.done
+.refused:
+	mov	edi,r13d
+	call	auth_ctx_free
+	mov	edi,ST_401
+	call	respond_status
+	jmp	.done
+.hash_failed:
+	mov	edi,r13d
+	call	auth_ctx_free
+	mov	esi,r14d
+	call	respond_hash_failed
+.done:
+	pop	r15
+	pop	r14
+	pop	r13
+	ret
+
+; The new password was hashed: store it and end every session.
+hcont_pw_new:
+	push	r13
+	push	r14
+	push	r15
+	mov	r13d,ecx
+	mov	r14,rsi
+	push	rax
+	mov	edi,ecx
+	call	auth_ctx_ptr
+	mov	r15,rax
+	lea	rdi,[r15+AC_PW]
+	mov	ecx,PASSWORD_MAX
+	call	secure_zero
+	pop	rax
+	test	eax,eax
+	jnz	.hash_failed
+	lea	rdi,[r15+AC_PHC_TEXT]
+	lea	rsi,[r15+AC_SALT]
+	mov	rdx,r14
+	call	phc_encode
+	mov	[r15+AC_PHC_LEN],eax
+	mov	rdi,r15
+	call	ctx_session_params
+	lea	rax,[r15+AC_PHC_TEXT]
+	mov	[g_note_params+32],rax
+	mov	eax,[r15+AC_PHC_LEN]
+	mov	[g_note_params+40],eax
+	mov	edi,STMT_SET_PASSWORD
+	mov	esi,CONT_SESSION_COUNT
+	lea	rdx,[g_note_params]
+	mov	ecx,3
+	mov	r8d,r13d
+	call	db_query
+	test	eax,eax
+	jz	.done
+	mov	edi,r13d
+	call	auth_ctx_free
+	call	respond_db_unavailable
+	jmp	.done
+.hash_failed:
+	mov	r14d,eax
+	mov	edi,r13d
+	call	auth_ctx_free
+	mov	esi,r14d
+	call	respond_hash_failed
+.done:
+	pop	r15
+	pop	r14
+	pop	r13
+	ret
+
+; g_note_params = the context's user and epoch. rdi = context.
+ctx_session_params:
+	lea	rax,[rdi+AC_USER]
+	mov	[g_note_params],rax
+	mov	dword [g_note_params+8],36
+	lea	rax,[rdi+AC_EPOCH]
+	mov	[g_note_params+16],rax
+	mov	eax,[rdi+AC_EPOCH_LEN]
+	mov	[g_note_params+24],eax
+	ret

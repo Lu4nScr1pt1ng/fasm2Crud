@@ -21,10 +21,12 @@ PORT = int(sys.argv[1])
 KEY = sys.argv[2] if len(sys.argv) > 2 else None
 
 
-def call(path, body, ctype="application/json", method="POST", close=False):
+def call(path, body, ctype="application/json", method="POST", close=False, token=None):
     raw = body if isinstance(body, bytes) else json.dumps(body).encode()
     head = (f"{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: {ctype}\r\n"
             f"Content-Length: {len(raw)}\r\n")
+    if token:
+        head += f"Authorization: Bearer {token}\r\n"
     if close:
         head += "Connection: close\r\n"
     s = socket.create_connection(("127.0.0.1", PORT))
@@ -124,5 +126,53 @@ st, h, _ = call("/v1/auth/logout", {"refresh_token": other.get("refresh_token", 
 check("logout", (204, None), (st, h.get("content-length")))
 check("refresh after logout", 401, call("/v1/auth/refresh", {"refresh_token": other.get("refresh_token", "")})[0])
 check("logout twice", 204, call("/v1/auth/logout", {"refresh_token": other.get("refresh_token", "")})[0])
+
+
+# ---- sessions: logout-all, password change, account deletion
+
+def login(c):
+    st, _, t = call("/v1/auth/login", c)
+    return t or {} if st == 200 else {}
+
+
+def notes(token):
+    return call("/v1/notes", b"", method="GET", token=token)[0]
+
+
+sess = {"email": f"sess-{secrets.token_hex(6)}@example.com", "password": "first password"}
+call("/v1/auth/register", sess)
+a, b = login(sess), login(sess)
+check("two sessions work", (200, 200), (notes(a.get("access_token")), notes(b.get("access_token"))))
+check("logout-all needs a token", 401, call("/v1/auth/logout-all", b"")[0])
+check("GET logout-all", 405, call("/v1/auth/logout-all", b"", method="GET", token=a.get("access_token"))[0])
+check("logout-all", 204, call("/v1/auth/logout-all", b"", token=a.get("access_token"))[0])
+check("its access token is dead at once", 401, notes(a.get("access_token")))
+check("so is the other session's", 401, notes(b.get("access_token")))
+check("and its refresh token", 401, call("/v1/auth/refresh", {"refresh_token": b.get("refresh_token", "")})[0])
+check("logout-all with a dead token", 401, call("/v1/auth/logout-all", b"", token=a.get("access_token"))[0])
+c = login(sess)
+check("a new login works again", 200, notes(c.get("access_token")))
+
+change = lambda tok, cur, new: call("/v1/auth/password", {"password": cur, "new_password": new}, token=tok)[0]
+check("password change with a wrong password", 401, change(c.get("access_token"), "wrong password", "second password"))
+check("password change to a short password", 422, change(c.get("access_token"), "first password", "short"))
+check("password change without a token", 401, change(None, "first password", "second password"))
+d = login(sess)
+check("password change", 204, change(c.get("access_token"), "first password", "second password"))
+check("it ends every session", (401, 401), (notes(c.get("access_token")), notes(d.get("access_token"))))
+check("the old password no longer logs in", 401, call("/v1/auth/login", sess)[0])
+sess["password"] = "second password"
+e = login(sess)
+check("the new one does", 200, notes(e.get("access_token")))
+
+delete = lambda tok, pw: call("/v1/auth/account", {"password": pw}, method="DELETE", token=tok)[0]
+st, h, _ = call("/v1/auth/account", {"password": "x"}, token=e.get("access_token"))
+check("POST /v1/auth/account", (405, "DELETE"), (st, h.get("allow")))
+check("account deletion with a wrong password", 401, delete(e.get("access_token"), "first password"))
+call("/v1/notes", {"title": "to be deleted"}, token=e.get("access_token"))
+check("account deletion", 204, delete(e.get("access_token"), "second password"))
+check("its token is dead", 401, notes(e.get("access_token")))
+check("it no longer logs in", 401, call("/v1/auth/login", sess)[0])
+check("the address can be registered again", 201, call("/v1/auth/register", sess)[0])
 
 sys.exit(1 if failed else 0)

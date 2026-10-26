@@ -165,21 +165,33 @@ pg_statement STMT_REVOKE_FAMILY, \
 	'(SELECT family_id FROM refresh_tokens WHERE token_hash = $1::bytea) AND revoked_at IS NULL'
 
 ; Notes (src/app/notes.inc). Times are RFC 3339 text, made by the database.
+; Every notes statement checks the session first: "a" holds the user only
+; while the token's session epoch is still the current one, so a token from
+; before logout-all, a password change or a deleted account finds nothing.
+; Each statement returns no row at all for a dead session (401), and at
+; least one row otherwise.
+;
+; INSERT ($1 user, $2 title, $3 body, $4 epoch): the note.
 pg_statement STMT_NOTE_INSERT, \
-	'INSERT INTO notes (user_id, title, body) VALUES ($1::uuid, $2, COALESCE($3, '''')) ', \
+	'WITH a AS (SELECT id FROM users WHERE id = $1::uuid AND session_epoch = $4::int) ', \
+	'INSERT INTO notes (user_id, title, body) SELECT a.id, $2, COALESCE($3, '''') FROM a ', \
 	'RETURNING id, title, body, version, ', \
 	'to_char(created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
 	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'')'
+; GET ($1 id, $2 user, $3 epoch): the note, or a row of NULLs (404).
 pg_statement STMT_NOTE_GET, \
-	'SELECT id, title, body, version, ', \
-	'to_char(created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
-	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
-	'FROM notes WHERE id = $1::uuid AND user_id = $2::uuid'
-; One row while the note exists: the updated note (all NULL when the
-; version did not match) and the current version. The row lock makes a
+	'WITH a AS (SELECT id FROM users WHERE id = $2::uuid AND session_epoch = $3::int) ', \
+	'SELECT n.id, n.title, n.body, n.version, ', \
+	'to_char(n.created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
+	'to_char(n.updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
+	'FROM a LEFT JOIN notes n ON n.id = $1::uuid AND n.user_id = a.id'
+; UPDATE ($1 id, $2 user, $3 version, $4 title, $5 body, $6 epoch): the
+; updated note (NULLs when the version did not match: 412) and the current
+; version (NULL when there is no such note: 404). The row lock makes a
 ; concurrent writer re-check the version after the first one commits.
 pg_statement STMT_NOTE_UPDATE, \
-	'WITH cur AS (SELECT version FROM notes WHERE id = $1::uuid AND user_id = $2::uuid), ', \
+	'WITH a AS (SELECT id FROM users WHERE id = $2::uuid AND session_epoch = $6::int), ', \
+	'cur AS (SELECT n.version FROM notes n JOIN a ON n.user_id = a.id WHERE n.id = $1::uuid), ', \
 	'upd AS (UPDATE notes n SET title = COALESCE($4, n.title), body = COALESCE($5, n.body), ', \
 	'version = n.version + 1, updated_at = now() FROM cur ', \
 	'WHERE n.id = $1::uuid AND n.user_id = $2::uuid AND n.version = $3::int ', \
@@ -187,22 +199,51 @@ pg_statement STMT_NOTE_UPDATE, \
 	'SELECT upd.id, upd.title, upd.body, upd.version, ', \
 	'to_char(upd.created_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
 	'to_char(upd.updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"''), ', \
-	'cur.version FROM cur LEFT JOIN upd ON true'
-; One row while the note exists: its version and how many rows went.
+	'cur.version FROM a LEFT JOIN cur ON true LEFT JOIN upd ON true'
+; DELETE ($1 id, $2 user, $3 version, $4 epoch): the current version (NULL:
+; 404) and how many rows went.
 pg_statement STMT_NOTE_DELETE, \
-	'WITH cur AS (SELECT version FROM notes WHERE id = $1::uuid AND user_id = $2::uuid), ', \
+	'WITH a AS (SELECT id FROM users WHERE id = $2::uuid AND session_epoch = $4::int), ', \
+	'cur AS (SELECT n.version FROM notes n JOIN a ON n.user_id = a.id WHERE n.id = $1::uuid), ', \
 	'del AS (DELETE FROM notes n USING cur WHERE n.id = $1::uuid AND n.user_id = $2::uuid ', \
 	'AND n.version = $3::int RETURNING n.id) ', \
-	'SELECT cur.version, (SELECT count(*) FROM del) FROM cur'
-; Keyset pages over notes_user_id_id; $2 is limit + 1, to see if more follow.
+	'SELECT cur.version, (SELECT count(*) FROM del) FROM a LEFT JOIN cur ON true'
+; Keyset pages over notes_user_id_id ($1 user, $2 limit + 1, [$3 cursor],
+; last: epoch). An empty page is one row of NULLs.
 pg_statement STMT_NOTES_PAGE, \
-	'SELECT id, title, version, ', \
-	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
-	'FROM notes WHERE user_id = $1::uuid ORDER BY id DESC LIMIT $2::int'
+	'WITH a AS (SELECT id FROM users WHERE id = $1::uuid AND session_epoch = $3::int) ', \
+	'SELECT n.id, n.title, n.version, to_char(n.updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
+	'FROM a LEFT JOIN LATERAL (SELECT id, title, version, updated_at FROM notes ', \
+	'WHERE user_id = a.id ORDER BY id DESC LIMIT $2::int) n ON true ORDER BY n.id DESC'
 pg_statement STMT_NOTES_PAGE_AFTER, \
-	'SELECT id, title, version, ', \
-	'to_char(updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
-	'FROM notes WHERE user_id = $1::uuid AND id < $3::uuid ORDER BY id DESC LIMIT $2::int'
+	'WITH a AS (SELECT id FROM users WHERE id = $1::uuid AND session_epoch = $4::int) ', \
+	'SELECT n.id, n.title, n.version, to_char(n.updated_at AT TIME ZONE ''UTC'', ''YYYY-MM-DD"T"HH24:MI:SS.US"Z"'') ', \
+	'FROM a LEFT JOIN LATERAL (SELECT id, title, version, updated_at FROM notes ', \
+	'WHERE user_id = a.id AND id < $3::uuid ORDER BY id DESC LIMIT $2::int) n ON true ORDER BY n.id DESC'
+
+; Sessions (src/app/auth.inc). Each returns how many users matched: 0 when
+; the session is already dead.
+; Every session of the user ends ($1 user, $2 epoch).
+pg_statement STMT_LOGOUT_ALL, \
+	'WITH u AS (UPDATE users SET session_epoch = session_epoch + 1 ', \
+	'WHERE id = $1::uuid AND session_epoch = $2::int RETURNING id), ', \
+	'r AS (UPDATE refresh_tokens t SET revoked_at = now() FROM u ', \
+	'WHERE t.user_id = u.id AND t.revoked_at IS NULL RETURNING 1) ', \
+	'SELECT count(*) FROM u'
+; The stored hash, for a live session ($1 user, $2 epoch); no row otherwise.
+pg_statement STMT_SESSION_HASH, \
+	'SELECT password_hash FROM users WHERE id = $1::uuid AND session_epoch = $2::int'
+; New password; every session ends ($1 user, $2 epoch, $3 PHC string).
+pg_statement STMT_SET_PASSWORD, \
+	'WITH u AS (UPDATE users SET password_hash = $3, session_epoch = session_epoch + 1 ', \
+	'WHERE id = $1::uuid AND session_epoch = $2::int RETURNING id), ', \
+	'r AS (UPDATE refresh_tokens t SET revoked_at = now() FROM u ', \
+	'WHERE t.user_id = u.id AND t.revoked_at IS NULL RETURNING 1) ', \
+	'SELECT count(*) FROM u'
+; The account and, by cascade, its notes and tokens ($1 user, $2 epoch).
+pg_statement STMT_DELETE_USER, \
+	'WITH u AS (DELETE FROM users WHERE id = $1::uuid AND session_epoch = $2::int RETURNING id) ', \
+	'SELECT count(*) FROM u'
 
 rodata
 	align 8

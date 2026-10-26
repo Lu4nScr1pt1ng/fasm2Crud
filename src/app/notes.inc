@@ -61,7 +61,7 @@ end rodata
 
 bss
 	align 8
-	g_note_params:	rb 5 * 16
+	g_note_params:	rb 6 * 16
 	g_note_uid:	rb 36		; signed-in user, UUID text
 	g_note_id:	rb 36		; note in the path
 	g_note_cursor:	rb 36
@@ -70,6 +70,8 @@ bss
 	g_note_limit	dd ?
 	g_note_has_cursor dd ?
 	g_note_num:	rb 12
+	g_note_epoch:	rb 12		; the token's session epoch, digits
+	g_note_epoch_len dd ?
 	g_note_hdr:	rb 128
 end bss
 
@@ -150,12 +152,19 @@ notes_route:
 	mov	edi,ST_404
 	jmp	respond_status
 
-; The signed-in user into g_note_uid. CF when there is none (401 sent).
+; The signed-in user into g_note_uid and its session epoch into
+; g_note_epoch (both text, for query parameters). CF when there is no valid
+; token (401 sent). The statements check the epoch against the database.
 note_auth:
 	sub	rsp,24
 	mov	rdi,rsp
 	call	request_bearer
 	jc	.unauthorized
+	lea	rdi,[g_note_epoch]
+	call	write_u32
+	lea	rax,[g_note_epoch]
+	sub	rdi,rax
+	mov	[g_note_epoch_len],edi
 	mov	rsi,rsp
 	lea	rdi,[g_note_uid]
 	call	uuid_format
@@ -324,9 +333,11 @@ note_create:
 	lea	rsi,[g_auth_vals+JV_SIZE]
 	mov	ecx,2
 	call	note_member_param
+	mov	ecx,[g_note_epoch_len]
+	note_param 3, g_note_epoch, ecx
 	mov	edi,STMT_NOTE_INSERT
 	mov	esi,CONT_NOTE_CREATED
-	mov	ecx,3
+	mov	ecx,4
 	jmp	note_query
 .status:
 	mov	edi,eax
@@ -339,9 +350,11 @@ note_get:
 	jc	.done
 	note_param 0, g_note_id, 36
 	note_param 1, g_note_uid, 36
+	mov	ecx,[g_note_epoch_len]
+	note_param 2, g_note_epoch, ecx
 	mov	edi,STMT_NOTE_GET
 	mov	esi,CONT_NOTE_GET
-	mov	ecx,2
+	mov	ecx,3
 	jmp	note_query
 .done:
 	ret
@@ -366,9 +379,11 @@ note_patch:
 	lea	rsi,[g_auth_vals+JV_SIZE]
 	mov	ecx,4
 	call	note_member_param
+	mov	ecx,[g_note_epoch_len]
+	note_param 5, g_note_epoch, ecx
 	mov	edi,STMT_NOTE_UPDATE
 	mov	esi,CONT_NOTE_UPDATED
-	mov	ecx,5
+	mov	ecx,6
 	jmp	note_query
 .status:
 	mov	edi,eax
@@ -386,9 +401,11 @@ note_delete:
 	note_param 1, g_note_uid, 36
 	mov	ecx,[g_note_ver_len]
 	note_param 2, g_note_ver, ecx
+	mov	ecx,[g_note_epoch_len]
+	note_param 3, g_note_epoch, ecx
 	mov	edi,STMT_NOTE_DELETE
 	mov	esi,CONT_NOTE_DELETED
-	mov	ecx,3
+	mov	ecx,4
 	jmp	note_query
 .status:
 	mov	edi,eax
@@ -411,13 +428,19 @@ notes_list:
 	sub	rdi,rax
 	note_param 0, g_note_uid, 36
 	note_param 1, g_note_num, edi
-	note_param 2, g_note_cursor, 36
-	mov	edi,STMT_NOTES_PAGE
-	mov	ecx,2
+	; The epoch is the last parameter: $3, or $4 after the cursor.
+	mov	ecx,[g_note_epoch_len]
 	cmp	dword [g_note_has_cursor],0
-	je	@f
-	mov	edi,STMT_NOTES_PAGE_AFTER
+	jne	.after
+	note_param 2, g_note_epoch, ecx
+	mov	edi,STMT_NOTES_PAGE
 	mov	ecx,3
+	jmp	@f
+.after:
+	note_param 2, g_note_cursor, 36
+	note_param 3, g_note_epoch, ecx
+	mov	edi,STMT_NOTES_PAGE_AFTER
+	mov	ecx,4
 @@:
 	mov	esi,CONT_NOTES_PAGE
 	jmp	note_query
@@ -822,17 +845,23 @@ cont_note_created:
 	jmp	respond_status
 .created:
 	call	pg_find_row
-	jc	.error
+	jc	respond_session_ended
 	mov	edi,ST_201
 	jmp	respond_note
-.error:
-	mov	edi,ST_500
+
+; No row at all: the session behind the token has ended (logout-all, a new
+; password, a deleted account).
+respond_session_ended:
+	mov	edi,ST_401
 	jmp	respond_status
 
 cont_note_get:
 	cmp	eax,PGR_OK
 	jne	respond_query_failed
 	call	pg_find_row
+	jc	respond_session_ended
+	xor	ecx,ecx
+	call	pg_field
 	jc	.not_found
 	mov	edi,ST_200
 	jmp	respond_note
@@ -845,7 +874,10 @@ cont_note_updated:
 	cmp	eax,PGR_OK
 	jne	respond_query_failed
 	call	pg_find_row
-	jc	.not_found
+	jc	respond_session_ended
+	mov	ecx,6
+	call	pg_field
+	jc	.not_found			; no current version: no such note
 	xor	ecx,ecx
 	call	pg_field
 	jc	.stale
@@ -868,6 +900,9 @@ cont_note_deleted:
 	cmp	eax,PGR_OK
 	jne	respond_query_failed
 	call	pg_find_row
+	jc	respond_session_ended
+	xor	ecx,ecx
+	call	pg_field
 	jc	.not_found
 	mov	ecx,1
 	call	pg_field
@@ -902,6 +937,22 @@ cont_notes_page:
 	sub	rsp,24
 	mov	rbx,rsi				; first message
 	mov	r15,rdx				; end
+	; No row: the session has ended. A row of NULLs: an empty page.
+	call	pg_find_row
+	jnc	@f
+	add	rsp,24
+	pop	r15
+	pop	r14
+	pop	r13
+	pop	rbp
+	pop	rbx
+	jmp	respond_session_ended
+@@:
+	xor	ecx,ecx
+	call	pg_field
+	jnc	@f
+	mov	rbx,r15				; nothing to list
+@@:
 	mov	qword [rsp],0
 	mov	dword [rsp+8],0
 	xor	ebp,ebp				; items in the page

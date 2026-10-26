@@ -16,13 +16,15 @@ CONT_NOTE_GET	= 7
 CONT_NOTE_UPDATED = 8
 CONT_NOTE_DELETED = 9
 CONT_NOTES_PAGE	= 10
+CONT_SESSION_COUNT = 11
+CONT_PW_USER	= 12
 
 rodata
 	align 8
 	pg_cont_tbl	dq cont_ready, cont_register, cont_login_user, cont_login_token
 			dq cont_refresh, cont_logout
 			dq cont_note_created, cont_note_get, cont_note_updated, cont_note_deleted
-			dq cont_notes_page
+			dq cont_notes_page, cont_session_count, cont_pw_user
 end rodata
 
 ; r12 = connection; g_req holds the parsed request.

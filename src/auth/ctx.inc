@@ -28,6 +28,7 @@ AC_PHC_TEXT	= 864		; 128: PHC string
 
 ACF_HASHING	= 1 shl 0	; a job is at the hasher: freed only by its reply
 ACF_NO_USER	= 1 shl 1	; login for an unknown address: hash, then refuse
+ACF_DELETE	= 1 shl 2	; password checked to delete the account
 
 bss
 	align 64

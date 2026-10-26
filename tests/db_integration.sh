@@ -21,6 +21,14 @@ check() {
 	if [ "$2" = "$3" ]; then echo "ok   $1"; else echo "FAIL $1: expected $2, got $3"; status=1; fi
 }
 code() { curl -q -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/readyz"; }
+# Up without a database: /healthz answers.
+wait_up() {
+	for _ in $(seq 100); do
+		[ "$(curl -q -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$1/healthz")" = 200 ] && return 0
+		sleep 0.1
+	done
+	return 1
+}
 wait_ready() {
 	for _ in $(seq 100); do [ "$(code "$1")" = 200 ] && return 0; sleep 0.1; done
 	return 1
@@ -65,7 +73,7 @@ kill $rl 2>/dev/null || true
 # /metrics adds up every worker and survives a worker restart.
 API_PORT=18094 API_WORKERS=4 ./build/fasm2crud 2>/dev/null &
 met=$!
-sleep 0.5
+wait_up 18094 || true
 python3 -I tests/metrics_api.py 18094 || status=1
 kill $met 2>/dev/null || true
 
