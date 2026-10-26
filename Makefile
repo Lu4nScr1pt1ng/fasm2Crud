@@ -52,6 +52,7 @@ itest: $(BIN)
 	./tests/db_integration.sh
 
 up:
+	./scripts/setup-env.sh
 	docker compose up -d --build
 
 down:
